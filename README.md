@@ -4,6 +4,7 @@
 [![Build Status](https://img.shields.io/badge/build-passing-brightgreen.svg)]()
 [![Version](https://img.shields.io/badge/version-1.0.0-blue.svg)]()
 [![Network](https://img.shields.io/badge/network-mainnet-green.svg)]()
+[![Telegram](https://img.shields.io/badge/Telegram-Join%20Chat-blue.svg?logo=telegram)](https://t.me/flow_protocol_main)
 
 ```
     ███████╗██╗      ██████╗ ██╗    ██╗    ████████╗ ██████╗ ██╗  ██╗███████╗███╗   ██╗
@@ -237,21 +238,26 @@ FTC provides a JSON-RPC API compatible with standard cryptocurrency infrastructu
 ```bash
 curl -X POST http://localhost:17318 \
   -H "Content-Type: application/json" \
-  -d '{"jsonrpc":"2.0","method":"getblockchaininfo","params":[],"id":1}'
+  -d '{"jsonrpc":"2.0","method":"getinfo","params":[],"id":1}'
 ```
 
 ### Key Methods
 
 | Method | Description |
 |--------|-------------|
-| `getblockchaininfo` | Get blockchain status |
+| `getinfo` | Get node status (blocks, peers, version) |
 | `getblockcount` | Get current block height |
-| `getblock` | Get block by hash or height |
+| `getbestblockhash` | Get latest block hash |
+| `getdifficulty` | Get current mining difficulty |
+| `getpeercount` | Get connected peer count |
 | `getbalance` | Get address balance |
-| `listunspent` | List UTXOs for address |
-| `sendrawtransaction` | Broadcast signed transaction |
-| `getpeerinfo` | Get connected peers |
+| `getblock` | Get block by hash or height |
 | `gettransaction` | Get transaction details |
+| `listunspent` | List UTXOs for address |
+| `sendtoaddress` | Send FTC to address |
+| `sendrawtransaction` | Broadcast signed transaction |
+| `getblocktemplate` | Get mining template |
+| `submitblock` | Submit mined block |
 
 ### Example: Check Balance
 

@@ -345,11 +345,68 @@ ftc_block_t* ftc_node_create_block_template(ftc_node_t* node, const ftc_address_
     block->header.version = 1;
     memcpy(block->header.prev_hash, node->chain->best_hash, 32);
     block->header.timestamp = (uint32_t)time(NULL);
-    /* Use previous block's bits (simplified - proper implementation would recalculate) */
-    if (node->chain->block_count > 0) {
+
+    /* Calculate bits with difficulty adjustment */
+    if (height == 0) {
+        block->header.bits = FTC_GENESIS_BITS;
+    } else if (height % FTC_DIFFICULTY_INTERVAL != 0) {
+        /* Not at adjustment boundary - use previous bits */
         block->header.bits = node->chain->blocks[node->chain->block_count - 1]->header.bits;
     } else {
-        block->header.bits = FTC_GENESIS_BITS;
+        /* Difficulty adjustment at interval boundary */
+        int first_idx = node->chain->block_count - FTC_DIFFICULTY_INTERVAL;
+        /* Skip genesis block (index 0) - its timestamp is from creation, not mining */
+        if (first_idx <= 0) first_idx = 1;
+
+        uint32_t first_time = node->chain->blocks[first_idx]->header.timestamp;
+        uint32_t last_time = node->chain->blocks[node->chain->block_count - 1]->header.timestamp;
+
+        int32_t actual_time = (int32_t)(last_time - first_time);
+        /* Adjust target_time proportionally if we have fewer blocks */
+        int blocks_counted = node->chain->block_count - 1 - first_idx;
+        if (blocks_counted < 1) blocks_counted = 1;
+        int32_t target_time = FTC_TARGET_BLOCK_TIME * blocks_counted;
+        if (target_time < 1) target_time = 1;
+
+        /* Limit to 4x adjustment */
+        if (actual_time < target_time / 4) actual_time = target_time / 4;
+        if (actual_time > target_time * 4) actual_time = target_time * 4;
+
+        /* Get current target and adjust */
+        uint32_t prev_bits = node->chain->blocks[node->chain->block_count - 1]->header.bits;
+        ftc_hash256_t target;
+        ftc_bits_to_target(prev_bits, target);
+
+        /* Multiply target by actual_time / target_time */
+        uint32_t t32[8];
+        for (int i = 0; i < 8; i++) {
+            t32[i] = (uint32_t)target[i*4] | ((uint32_t)target[i*4+1] << 8) |
+                     ((uint32_t)target[i*4+2] << 16) | ((uint32_t)target[i*4+3] << 24);
+        }
+
+        uint64_t carry = 0;
+        for (int i = 0; i < 8; i++) {
+            uint64_t prod = (uint64_t)t32[i] * actual_time + carry;
+            t32[i] = (uint32_t)prod;
+            carry = prod >> 32;
+        }
+
+        uint64_t rem = 0;
+        for (int i = 7; i >= 0; i--) {
+            uint64_t div = (rem << 32) | t32[i];
+            t32[i] = (uint32_t)(div / target_time);
+            rem = div % target_time;
+        }
+
+        for (int i = 0; i < 8; i++) {
+            target[i*4] = t32[i] & 0xff;
+            target[i*4+1] = (t32[i] >> 8) & 0xff;
+            target[i*4+2] = (t32[i] >> 16) & 0xff;
+            target[i*4+3] = (t32[i] >> 24) & 0xff;
+        }
+
+        block->header.bits = ftc_target_to_bits(target);
+        printf("[NODE] Difficulty adjusted at height %u: bits=0x%08x\n", height, block->header.bits);
     }
     block->header.nonce = 0;
 
@@ -625,6 +682,93 @@ static void p2p_on_inv(ftc_p2p_t* p2p, ftc_peer_t* peer, const ftc_inv_t* inv, s
     free(needed);
 }
 
+static void p2p_on_headers(ftc_p2p_t* p2p, ftc_peer_t* peer, const ftc_block_header_t* headers, size_t count)
+{
+    ftc_node_t* node = (ftc_node_t*)p2p->user_data;
+
+    if (count == 0) {
+        printf("[NODE] Received empty headers response\n");
+        return;
+    }
+
+    printf("[NODE] Received %zu headers from %s\n", count, peer->ip_str);
+
+    /* Request blocks for headers we don't have */
+    ftc_inv_t* inv = (ftc_inv_t*)malloc(count * sizeof(ftc_inv_t));
+    if (!inv) return;
+
+    size_t inv_count = 0;
+    for (size_t i = 0; i < count; i++) {
+        ftc_hash256_t header_hash;
+        ftc_hash_block_header(&headers[i], header_hash);
+
+        /* Check if we already have this block */
+        if (!ftc_chain_get_block(node->chain, header_hash)) {
+            inv[inv_count].type = FTC_INV_BLOCK;
+            memcpy(inv[inv_count].hash, header_hash, 32);
+            inv_count++;
+        }
+    }
+
+    if (inv_count > 0) {
+        printf("[NODE] Requesting %zu blocks\n", inv_count);
+        ftc_peer_send_getdata(peer, inv, inv_count);
+    }
+
+    free(inv);
+
+    /* If we got max headers, request more */
+    if (count >= 2000) {
+        ftc_hash256_t last_hash;
+        ftc_hash_block_header(&headers[count - 1], last_hash);
+        ftc_hash256_t stop_hash = {0};
+        ftc_peer_send_getheaders(peer, &last_hash, 1, stop_hash);
+    }
+}
+
+static void p2p_on_getheaders(ftc_p2p_t* p2p, ftc_peer_t* peer, const ftc_hash256_t* locator, size_t count, const ftc_hash256_t stop_hash)
+{
+    (void)stop_hash;
+    ftc_node_t* node = (ftc_node_t*)p2p->user_data;
+
+    if (count == 0) return;
+
+    /* Find the first locator hash we have */
+    int start_height = -1;
+    for (size_t i = 0; i < count; i++) {
+        for (int j = 0; j < node->chain->block_count; j++) {
+            ftc_hash256_t block_hash;
+            ftc_block_hash(node->chain->blocks[j], block_hash);
+            if (memcmp(block_hash, locator[i], 32) == 0) {
+                start_height = j;
+                break;
+            }
+        }
+        if (start_height >= 0) break;
+    }
+
+    /* Start from genesis if no match */
+    if (start_height < 0) start_height = 0;
+
+    /* Send headers starting from start_height + 1 */
+    size_t header_count = 0;
+    size_t max_headers = 2000;
+    ftc_block_header_t* headers = (ftc_block_header_t*)malloc(max_headers * sizeof(ftc_block_header_t));
+    if (!headers) return;
+
+    for (int i = start_height + 1; i < node->chain->block_count && header_count < max_headers; i++) {
+        memcpy(&headers[header_count], &node->chain->blocks[i]->header, sizeof(ftc_block_header_t));
+        header_count++;
+    }
+
+    if (header_count > 0) {
+        printf("[NODE] Sending %zu headers to %s (from height %d)\n", header_count, peer->ip_str, start_height + 1);
+        ftc_peer_send_headers(peer, headers, header_count);
+    }
+
+    free(headers);
+}
+
 /*==============================================================================
  * NODE LIFECYCLE
  *============================================================================*/
@@ -752,6 +896,8 @@ bool ftc_node_start(ftc_node_t* node)
         .on_tx = p2p_on_tx,
         .on_inv = p2p_on_inv,
         .on_getdata = p2p_on_getdata,
+        .on_headers = p2p_on_headers,
+        .on_getheaders = p2p_on_getheaders,
     };
     ftc_p2p_set_callbacks(node->p2p, &p2p_callbacks, node);
 

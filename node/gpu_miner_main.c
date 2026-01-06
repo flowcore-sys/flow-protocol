@@ -430,12 +430,28 @@ static char* rpc_call(int node_idx, const char* method, const char* params)
     close(sock);
 #endif
 
-    char* body = strstr(response, "\r\n\r\n");
-    if (body) {
-        body += 4;
-        memmove(response, body, strlen(body) + 1);
+    /* Check for valid response */
+    if (total == 0) {
+        free(response);
+        node->failures++;
+        return NULL;
     }
 
+    char* body = strstr(response, "\r\n\r\n");
+    if (!body) {
+        free(response);
+        node->failures++;
+        return NULL;
+    }
+
+    body += 4;
+    if (strlen(body) == 0 || !strchr(body, '{')) {
+        free(response);
+        node->failures++;
+        return NULL;
+    }
+
+    memmove(response, body, strlen(body) + 1);
     node->failures = 0;
     return response;
 }

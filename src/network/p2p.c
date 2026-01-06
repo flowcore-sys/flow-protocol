@@ -891,6 +891,39 @@ static void process_addr(ftc_p2p_t* p2p, ftc_peer_t* peer, const uint8_t* payloa
     free(addrs);
 }
 
+static void process_getheaders(ftc_p2p_t* p2p, ftc_peer_t* peer, const uint8_t* payload, size_t len)
+{
+    if (len < 4) return;
+
+    /* Parse version (4 bytes, little-endian) */
+    size_t pos = 4;
+
+    /* Parse locator count (varint) */
+    uint64_t count;
+    pos += ftc_varint_decode(payload + pos, len - pos, &count);
+
+    if (count == 0 || count > 2000 || pos + count * 32 + 32 > len) return;
+
+    /* Parse locator hashes */
+    ftc_hash256_t* locator = (ftc_hash256_t*)malloc(count * sizeof(ftc_hash256_t));
+    if (!locator) return;
+
+    for (size_t i = 0; i < count; i++) {
+        memcpy(locator[i], payload + pos, 32);
+        pos += 32;
+    }
+
+    /* Parse stop hash */
+    ftc_hash256_t stop_hash;
+    memcpy(stop_hash, payload + pos, 32);
+
+    if (p2p->callbacks && p2p->callbacks->on_getheaders) {
+        p2p->callbacks->on_getheaders(p2p, peer, locator, (size_t)count, stop_hash);
+    }
+
+    free(locator);
+}
+
 static void process_message(ftc_p2p_t* p2p, ftc_peer_t* peer, const ftc_msg_header_t* header, const uint8_t* payload)
 {
     ftc_msg_type_t type = ftc_msg_string_to_type(header->command);
@@ -928,6 +961,9 @@ static void process_message(ftc_p2p_t* p2p, ftc_peer_t* peer, const ftc_msg_head
             break;
         case FTC_MSG_GETADDR:
             /* TODO: respond with known addresses */
+            break;
+        case FTC_MSG_GETHEADERS:
+            process_getheaders(p2p, peer, payload, header->length);
             break;
         default:
             break;
