@@ -1,0 +1,47 @@
+# Build directories
+build/
+build-gpu/
+cmake-build-*/
+out/
+
+# IDE
+.vscode/
+.idea/
+.vs/
+.claude/
+*.swp
+*.swo
+*~
+CMakeSettings.json
+nul
+
+# Compiled
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.dll
+*.exe
+*.pdb
+
+# Data directories
+nodedata/
+chaindata/
+walletdata/
+
+# Keys and sensitive data
+*.pem
+*.key
+wallet.dat
+peers.dat
+
+# Temporary
+*.tmp
+*.log
+*.tar
+*.tar.gz
+
+# OS
+.DS_Store
+Thumbs.db
