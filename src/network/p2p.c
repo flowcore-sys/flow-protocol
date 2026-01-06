@@ -648,9 +648,20 @@ static void process_version(ftc_p2p_t* p2p, ftc_peer_t* peer, const uint8_t* pay
     size_t varint_size = ftc_varint_decode(payload + pos, len - pos, &ua_len);
     pos += varint_size;
 
-    if (ua_len > 0 && ua_len < sizeof(peer->user_agent)) {
+    /* Bounds check: ensure we don't read past payload */
+    if (ua_len > 0 && ua_len < sizeof(peer->user_agent) && pos + ua_len <= len) {
         memcpy(peer->user_agent, payload + pos, ua_len);
         peer->user_agent[ua_len] = '\0';
+    } else if (ua_len >= sizeof(peer->user_agent) || pos + ua_len > len) {
+        /* Truncate or skip if invalid */
+        size_t copy_len = (len > pos) ? (len - pos) : 0;
+        if (copy_len > sizeof(peer->user_agent) - 1) {
+            copy_len = sizeof(peer->user_agent) - 1;
+        }
+        if (copy_len > 0) {
+            memcpy(peer->user_agent, payload + pos, copy_len);
+        }
+        peer->user_agent[copy_len] = '\0';
     }
     pos += ua_len;
 

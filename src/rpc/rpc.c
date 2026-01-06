@@ -927,25 +927,26 @@ static void rpc_sendtoaddress(ftc_rpc_server_t* rpc, ftc_json_t* json, const cha
         return;
     }
 
+    /* Calculate txid before sending (send_tx takes ownership) */
+    ftc_hash256_t txid;
+    ftc_tx_hash(tx, txid);
+    char hex[65];
+    ftc_hash_to_hex(txid, hex);
+
     if (!rpc->handlers->send_tx(rpc->handlers->user_data, tx)) {
         ftc_tx_free(tx);
         rpc_error(json, -25, "Transaction rejected", id);
         return;
     }
 
-    /* Return txid */
-    ftc_hash256_t txid;
-    ftc_tx_hash(tx, txid);
-    char hex[65];
-    ftc_hash_to_hex(txid, hex);
+    /* tx is now owned by mempool - DO NOT free it here */
 
+    /* Return txid */
     ftc_json_object_start(json);
     ftc_json_kv_string(json, "jsonrpc", "2.0");
     ftc_json_kv_string(json, "result", hex);
     ftc_json_kv_string(json, "id", id);
     ftc_json_object_end(json);
-
-    ftc_tx_free(tx);
 }
 
 static void rpc_listunspent(ftc_rpc_server_t* rpc, ftc_json_t* json, const char* params, const char* id)

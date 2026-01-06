@@ -79,7 +79,12 @@ bool ftc_chain_init(ftc_chain_t* chain)
     /* Add genesis to chain */
     if (chain->block_count >= chain->block_capacity) {
         int new_cap = chain->block_capacity * 2;
-        chain->blocks = (ftc_block_t**)realloc(chain->blocks, new_cap * sizeof(ftc_block_t*));
+        ftc_block_t** new_blocks = (ftc_block_t**)realloc(chain->blocks, new_cap * sizeof(ftc_block_t*));
+        if (!new_blocks) {
+            chain_free(chain);
+            return NULL;
+        }
+        chain->blocks = new_blocks;
         chain->block_capacity = new_cap;
     }
 
@@ -117,7 +122,12 @@ bool ftc_chain_add_block(ftc_node_t* node, ftc_block_t* block)
     /* Expand if needed */
     if (chain->block_count >= chain->block_capacity) {
         int new_cap = chain->block_capacity * 2;
-        chain->blocks = (ftc_block_t**)realloc(chain->blocks, new_cap * sizeof(ftc_block_t*));
+        ftc_block_t** new_blocks = (ftc_block_t**)realloc(chain->blocks, new_cap * sizeof(ftc_block_t*));
+        if (!new_blocks) {
+            printf("[NODE] Failed to expand block storage\n");
+            return false;
+        }
+        chain->blocks = new_blocks;
         chain->block_capacity = new_cap;
     }
 
