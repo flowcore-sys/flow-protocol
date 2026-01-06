@@ -46,12 +46,16 @@ static ftc_chain_t* chain_new(void)
         return NULL;
     }
 
+    FTC_MUTEX_INIT(chain->mutex);
+
     return chain;
 }
 
 static void chain_free(ftc_chain_t* chain)
 {
     if (!chain) return;
+
+    FTC_MUTEX_DESTROY(chain->mutex);
 
     for (int i = 0; i < chain->block_count; i++) {
         if (chain->blocks[i]) {
@@ -114,8 +118,12 @@ bool ftc_chain_add_block(ftc_node_t* node, ftc_block_t* block)
 {
     ftc_chain_t* chain = node->chain;
 
+    /* Lock for thread safety */
+    FTC_MUTEX_LOCK(chain->mutex);
+
     /* Validate block */
     if (!ftc_node_validate_block(node, block)) {
+        FTC_MUTEX_UNLOCK(chain->mutex);
         return false;
     }
 
@@ -125,6 +133,7 @@ bool ftc_chain_add_block(ftc_node_t* node, ftc_block_t* block)
         ftc_block_t** new_blocks = (ftc_block_t**)realloc(chain->blocks, new_cap * sizeof(ftc_block_t*));
         if (!new_blocks) {
             printf("[NODE] Failed to expand block storage\n");
+            FTC_MUTEX_UNLOCK(chain->mutex);
             return false;
         }
         chain->blocks = new_blocks;
@@ -134,9 +143,18 @@ bool ftc_chain_add_block(ftc_node_t* node, ftc_block_t* block)
     /* Clone block */
     size_t block_size = ftc_block_serialize(block, NULL, 0);
     uint8_t* block_data = (uint8_t*)malloc(block_size);
+    if (!block_data) {
+        FTC_MUTEX_UNLOCK(chain->mutex);
+        return false;
+    }
     ftc_block_serialize(block, block_data, block_size);
     ftc_block_t* block_copy = ftc_block_deserialize(block_data, block_size);
     free(block_data);
+
+    if (!block_copy) {
+        FTC_MUTEX_UNLOCK(chain->mutex);
+        return false;
+    }
 
     chain->blocks[chain->block_count++] = block_copy;
     chain->best_height++;
@@ -181,26 +199,35 @@ bool ftc_chain_add_block(ftc_node_t* node, ftc_block_t* block)
         ftc_mempool_remove(node->mempool, txid);
     }
 
+    FTC_MUTEX_UNLOCK(chain->mutex);
     return true;
 }
 
 ftc_block_t* ftc_chain_get_block(ftc_chain_t* chain, const ftc_hash256_t hash)
 {
+    FTC_MUTEX_LOCK(chain->mutex);
     for (int i = 0; i < chain->block_count; i++) {
         ftc_hash256_t block_hash;
         ftc_block_hash(chain->blocks[i], block_hash);
         if (memcmp(block_hash, hash, 32) == 0) {
-            return chain->blocks[i];
+            ftc_block_t* block = chain->blocks[i];
+            FTC_MUTEX_UNLOCK(chain->mutex);
+            return block;
         }
     }
+    FTC_MUTEX_UNLOCK(chain->mutex);
     return NULL;
 }
 
 ftc_block_t* ftc_chain_get_block_at(ftc_chain_t* chain, uint32_t height)
 {
+    FTC_MUTEX_LOCK(chain->mutex);
     if (height < (uint32_t)chain->block_count) {
-        return chain->blocks[height];
+        ftc_block_t* block = chain->blocks[height];
+        FTC_MUTEX_UNLOCK(chain->mutex);
+        return block;
     }
+    FTC_MUTEX_UNLOCK(chain->mutex);
     return NULL;
 }
 
@@ -215,7 +242,7 @@ bool ftc_node_validate_block(ftc_node_t* node, const ftc_block_t* block)
         ftc_hash256_t prev_hash;
         ftc_block_hash(node->chain->blocks[node->chain->block_count - 1], prev_hash);
         if (memcmp(block->header.prev_hash, prev_hash, 32) != 0) {
-            printf("[NODE] Block has wrong prev_hash\n");
+            /* Silent reject - too noisy during sync */
             return false;
         }
     }
@@ -339,6 +366,9 @@ ftc_block_t* ftc_node_create_block_template(ftc_node_t* node, const ftc_address_
     ftc_block_t* block = ftc_block_new();
     if (!block) return NULL;
 
+    /* Lock chain for reading */
+    FTC_MUTEX_LOCK(node->chain->mutex);
+
     uint32_t height = node->chain->best_height + 1;
 
     /* Set header */
@@ -408,7 +438,11 @@ ftc_block_t* ftc_node_create_block_template(ftc_node_t* node, const ftc_address_
         block->header.bits = ftc_target_to_bits(target);
         printf("[NODE] Difficulty adjusted at height %u: bits=0x%08x\n", height, block->header.bits);
     }
-    block->header.nonce = 0;
+
+    FTC_MUTEX_UNLOCK(node->chain->mutex);
+
+    /* Add entropy to prevent template collision when multiple miners request same second */
+    block->header.nonce = (uint32_t)rand() ^ ((uint32_t)clock() << 16);
 
     /* Create coinbase */
     uint64_t reward = ftc_get_block_reward(height);

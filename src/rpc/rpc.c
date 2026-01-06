@@ -77,25 +77,31 @@ void ftc_json_free(ftc_json_t* json)
     }
 }
 
-static void json_ensure_capacity(ftc_json_t* json, size_t needed)
+static bool json_ensure_capacity(ftc_json_t* json, size_t needed)
 {
     if (json->len + needed >= json->capacity) {
-        json->capacity = (json->len + needed) * 2;
-        json->data = (char*)realloc(json->data, json->capacity);
+        size_t new_capacity = (json->len + needed) * 2;
+        char* new_data = (char*)realloc(json->data, new_capacity);
+        if (!new_data) {
+            return false;  /* Allocation failed, keep old buffer */
+        }
+        json->data = new_data;
+        json->capacity = new_capacity;
     }
+    return true;
 }
 
 static void json_append(ftc_json_t* json, const char* str)
 {
     size_t len = strlen(str);
-    json_ensure_capacity(json, len + 1);
+    if (!json_ensure_capacity(json, len + 1)) return;
     memcpy(json->data + json->len, str, len + 1);
     json->len += len;
 }
 
 static void json_append_char(ftc_json_t* json, char c)
 {
-    json_ensure_capacity(json, 2);
+    if (!json_ensure_capacity(json, 2)) return;
     json->data[json->len++] = c;
     json->data[json->len] = '\0';
 }
@@ -1085,9 +1091,20 @@ static void rpc_getblocktemplate(ftc_rpc_server_t* rpc, ftc_json_t* json, const 
     /* Serialize block to hex */
     size_t size = ftc_block_serialize(block, NULL, 0);
     uint8_t* data = (uint8_t*)malloc(size);
+    if (!data) {
+        ftc_block_free(block);
+        rpc_error(json, -1, "Memory allocation failed", id);
+        return;
+    }
     ftc_block_serialize(block, data, size);
 
     char* hex = (char*)malloc(size * 2 + 1);
+    if (!hex) {
+        free(data);
+        ftc_block_free(block);
+        rpc_error(json, -1, "Memory allocation failed", id);
+        return;
+    }
     for (size_t i = 0; i < size; i++) {
         sprintf(hex + i * 2, "%02x", data[i]);
     }
@@ -1287,11 +1304,14 @@ static void handle_client(ftc_rpc_server_t* rpc, ftc_rpc_socket_t client)
         /* Expand buffer if needed */
         size_t needed = (body - request) + content_len + 1;
         if (needed > request_capacity && needed <= FTC_RPC_MAX_REQUEST) {
+            size_t body_offset = body - request;  /* Save offset before realloc */
             char* new_buf = (char*)realloc(request, needed);
             if (new_buf) {
-                body = new_buf + (body - request);  /* Adjust body pointer */
                 request = new_buf;
+                body = request + body_offset;  /* Restore body pointer */
                 request_capacity = needed;
+            } else {
+                /* Realloc failed, continue with what we have */
             }
         }
 

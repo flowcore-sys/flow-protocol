@@ -16,6 +16,29 @@
 #include "../src/rpc/rpc.h"
 #include "../src/wallet/wallet.h"
 
+#ifdef _WIN32
+#include <windows.h>
+typedef CRITICAL_SECTION ftc_mutex_t;
+#define FTC_MUTEX_INIT(m) InitializeCriticalSection(&(m))
+#define FTC_MUTEX_DESTROY(m) DeleteCriticalSection(&(m))
+#define FTC_MUTEX_LOCK(m) EnterCriticalSection(&(m))
+#define FTC_MUTEX_UNLOCK(m) LeaveCriticalSection(&(m))
+#else
+#include <pthread.h>
+typedef pthread_mutex_t ftc_mutex_t;
+static inline void ftc_mutex_init_recursive(pthread_mutex_t* m) {
+    pthread_mutexattr_t attr;
+    pthread_mutexattr_init(&attr);
+    pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
+    pthread_mutex_init(m, &attr);
+    pthread_mutexattr_destroy(&attr);
+}
+#define FTC_MUTEX_INIT(m) ftc_mutex_init_recursive(&(m))
+#define FTC_MUTEX_DESTROY(m) pthread_mutex_destroy(&(m))
+#define FTC_MUTEX_LOCK(m) pthread_mutex_lock(&(m))
+#define FTC_MUTEX_UNLOCK(m) pthread_mutex_unlock(&(m))
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -72,6 +95,9 @@ typedef struct {
 
     /* Genesis */
     ftc_block_t*    genesis;
+
+    /* Thread safety */
+    ftc_mutex_t     mutex;
 
 } ftc_chain_t;
 
