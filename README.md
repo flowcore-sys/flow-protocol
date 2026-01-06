@@ -190,6 +190,8 @@ make -j$(sysctl -n hw.ncpu)
 
 ## Running a Node
 
+> **Detailed Guide:** See [docs/NODE_SETUP.md](docs/NODE_SETUP.md) for complete node setup instructions, including systemd service, cloud deployment, and becoming a seed node.
+
 ### Start a Full Node
 
 ```bash
