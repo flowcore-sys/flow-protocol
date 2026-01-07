@@ -49,6 +49,7 @@ static void enable_ansi_colors(void)
 #include <sys/time.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <ifaddrs.h>
 typedef int miner_socket_t;
 #define MINER_INVALID_SOCKET -1
 #define enable_ansi_colors() ((void)0)
@@ -244,6 +245,51 @@ static bool ip_exists(const char* ip)
     return false;
 }
 
+/* Check if IP belongs to local machine */
+static bool is_local_ip(const char* ip)
+{
+    /* Always skip localhost */
+    if (strncmp(ip, "127.", 4) == 0) return true;
+
+#ifdef _WIN32
+    char hostname[256];
+    if (gethostname(hostname, sizeof(hostname)) != 0) return false;
+
+    struct addrinfo hints, *result, *rp;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_INET;
+
+    if (getaddrinfo(hostname, NULL, &hints, &result) != 0) return false;
+
+    for (rp = result; rp != NULL; rp = rp->ai_next) {
+        struct sockaddr_in* addr = (struct sockaddr_in*)rp->ai_addr;
+        char local_ip[64];
+        inet_ntop(AF_INET, &addr->sin_addr, local_ip, sizeof(local_ip));
+        if (strcmp(ip, local_ip) == 0) {
+            freeaddrinfo(result);
+            return true;
+        }
+    }
+    freeaddrinfo(result);
+#else
+    struct ifaddrs *ifaddr, *ifa;
+    if (getifaddrs(&ifaddr) == -1) return false;
+
+    for (ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next) {
+        if (ifa->ifa_addr == NULL || ifa->ifa_addr->sa_family != AF_INET) continue;
+        struct sockaddr_in* addr = (struct sockaddr_in*)ifa->ifa_addr;
+        char local_ip[64];
+        inet_ntop(AF_INET, &addr->sin_addr, local_ip, sizeof(local_ip));
+        if (strcmp(ip, local_ip) == 0) {
+            freeifaddrs(ifaddr);
+            return true;
+        }
+    }
+    freeifaddrs(ifaddr);
+#endif
+    return false;
+}
+
 static void discover_nodes(void)
 {
     g_node_count = 0;
@@ -262,6 +308,7 @@ static void discover_nodes(void)
             inet_ntop(AF_INET, &addr->sin_addr, ip, sizeof(ip));
 
             if (ip_exists(ip)) continue;
+            if (is_local_ip(ip)) continue;  /* Skip own IP */
 
             strncpy(g_nodes[g_node_count].host, DNS_SEEDS[i], sizeof(g_nodes[g_node_count].host) - 1);
             strncpy(g_nodes[g_node_count].ip, ip, sizeof(g_nodes[g_node_count].ip) - 1);
