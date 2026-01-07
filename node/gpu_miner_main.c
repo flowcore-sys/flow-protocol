@@ -128,6 +128,7 @@ static int g_active_node = -1;
 
 static volatile bool g_running = true;
 static char g_miner_address[64] = {0};
+static char g_custom_node[256] = {0};  /* Custom node host:port */
 static bool g_color = true;
 static uint32_t g_device_mask = 0;  /* 0 = all devices */
 
@@ -335,6 +336,31 @@ static int quick_connect_test(const char* ip, uint16_t port)
 static void discover_nodes(void)
 {
     g_node_count = 0;
+
+    /* Use custom node if specified */
+    if (g_custom_node[0]) {
+        char host[256];
+        uint16_t port = RPC_PORT;
+        strncpy(host, g_custom_node, sizeof(host) - 1);
+
+        /* Parse host:port */
+        char* colon = strchr(host, ':');
+        if (colon) {
+            *colon = '\0';
+            port = (uint16_t)atoi(colon + 1);
+        }
+
+        strncpy(g_nodes[0].host, host, sizeof(g_nodes[0].host) - 1);
+        strncpy(g_nodes[0].ip, host, sizeof(g_nodes[0].ip) - 1);
+        g_nodes[0].port = port;
+        g_nodes[0].latency_ms = 0;
+        g_nodes[0].active = true;
+        g_nodes[0].connected = true;
+        g_nodes[0].height = 0;
+        g_nodes[0].failures = 0;
+        g_node_count = 1;
+        return;
+    }
 
     for (int i = 0; DNS_SEEDS[i] != NULL && g_node_count < MAX_NODES; i++) {
         struct addrinfo hints, *result, *rp;
@@ -1046,6 +1072,7 @@ static void print_help(void)
     printf("Usage: ftc-miner-gpu -address <addr> [options]\n\n");
     printf("Options:\n");
     printf("  -address <addr>   Mining reward address (required)\n");
+    printf("  -node <host:port> Connect to specific node (default: DNS seeds)\n");
     printf("  -devices <0,1,2>  GPU device IDs to use (default: all)\n");
     printf("  -intensity <n>    Mining intensity 1-100 (default: 100)\n");
     printf("  -no-color         Disable colored output\n");
@@ -1053,6 +1080,7 @@ static void print_help(void)
     printf("  -help             Show this help\n\n");
     printf("Example:\n");
     printf("  ftc-miner-gpu -address 14CC2YgUzyMMhpPtXSwfYyHhus9kSYp6xo\n");
+    printf("  ftc-miner-gpu -address <addr> -node 127.0.0.1:17318\n");
     printf("  ftc-miner-gpu -address <addr> -devices 0,1\n\n");
 }
 
@@ -1085,6 +1113,9 @@ int main(int argc, char* argv[])
         }
         else if (strcmp(argv[i], "-address") == 0 && i + 1 < argc) {
             strncpy(g_miner_address, argv[++i], sizeof(g_miner_address) - 1);
+        }
+        else if (strcmp(argv[i], "-node") == 0 && i + 1 < argc) {
+            strncpy(g_custom_node, argv[++i], sizeof(g_custom_node) - 1);
         }
         else if (strcmp(argv[i], "-devices") == 0 && i + 1 < argc) {
             parse_devices(argv[++i]);

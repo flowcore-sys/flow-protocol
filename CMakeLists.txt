@@ -156,10 +156,9 @@ if(FTC_BUILD_CUDA)
         # Fix CUDA 13.x nvcc issues with MSVC flags
         set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Xcompiler=/wd4996")
         set(CMAKE_CUDA_FLAGS_RELEASE "-O3")
-        # Remove CMAKE_INTDIR from CUDA defines to fix nvcc quoting issue
+        # Remove all compile definitions from CUDA target to fix nvcc quoting issue with CMAKE_INTDIR
         set_property(TARGET ftc-cuda PROPERTY COMPILE_DEFINITIONS "")
-        # Disable PDB for CUDA (fixes nvcc comma parsing bug)
-        set(CMAKE_CUDA_COMPILE_OBJECT "<CMAKE_CUDA_COMPILER> <INCLUDES> <FLAGS> -c <SOURCE> -o <OBJECT>")
+        set_property(SOURCE src/miner/keccak256_cuda.cu PROPERTY COMPILE_DEFINITIONS "")
     else()
         # Linux: minimal flags, avoid passing gcc flags to nvcc
         set(CMAKE_CUDA_FLAGS "-O3")

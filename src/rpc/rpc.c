@@ -355,6 +355,9 @@ bool ftc_rpc_start(ftc_rpc_server_t* rpc, uint16_t port)
 
     rpc->listen_socket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (rpc->listen_socket == FTC_RPC_INVALID_SOCKET) {
+#ifdef _WIN32
+        printf("[RPC] socket() failed: %d\n", WSAGetLastError());
+#endif
         return false;
     }
 
@@ -372,12 +375,18 @@ bool ftc_rpc_start(ftc_rpc_server_t* rpc, uint16_t port)
     addr.sin_port = htons(port);
 
     if (bind(rpc->listen_socket, (struct sockaddr*)&addr, sizeof(addr)) != 0) {
+#ifdef _WIN32
+        printf("[RPC] bind() failed: %d\n", WSAGetLastError());
+#endif
         close_rpc_socket(rpc->listen_socket);
         rpc->listen_socket = FTC_RPC_INVALID_SOCKET;
         return false;
     }
 
     if (listen(rpc->listen_socket, 10) != 0) {
+#ifdef _WIN32
+        printf("[RPC] listen() failed: %d\n", WSAGetLastError());
+#endif
         close_rpc_socket(rpc->listen_socket);
         rpc->listen_socket = FTC_RPC_INVALID_SOCKET;
         return false;
@@ -1474,7 +1483,13 @@ void ftc_rpc_poll(ftc_rpc_server_t* rpc, int timeout_ms)
     tv.tv_usec = (timeout_ms % 1000) * 1000;
 
     int ret = select((int)(max_fd + 1), &read_fds, NULL, NULL, &tv);
-    if (ret <= 0) return;
+    if (ret < 0) {
+#ifdef _WIN32
+        printf("[RPC] select() error: %d\n", WSAGetLastError());
+#endif
+        return;
+    }
+    if (ret == 0) return;  /* Timeout */
 
     if (FD_ISSET(rpc->listen_socket, &read_fds)) {
         struct sockaddr_in addr;
@@ -1482,7 +1497,17 @@ void ftc_rpc_poll(ftc_rpc_server_t* rpc, int timeout_ms)
         ftc_rpc_socket_t client = accept(rpc->listen_socket, (struct sockaddr*)&addr, &addr_len);
 
         if (client != FTC_RPC_INVALID_SOCKET) {
+            char* client_ip = inet_ntoa(addr.sin_addr);
+            printf("[RPC] Accepted connection from %s\n", client_ip);
             handle_client(rpc, client);
+            printf("[RPC] Finished handling %s\n", client_ip);
+        } else {
+#ifdef _WIN32
+            int err = WSAGetLastError();
+            if (err != WSAEWOULDBLOCK) {
+                printf("[RPC] accept() error: %d\n", err);
+            }
+#endif
         }
     }
 }
