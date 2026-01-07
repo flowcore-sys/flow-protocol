@@ -290,6 +290,48 @@ static bool is_local_ip(const char* ip)
     return false;
 }
 
+/* Quick connectivity test (returns latency or 9999 if unreachable) */
+static int quick_connect_test(const char* ip, uint16_t port)
+{
+    miner_socket_t sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (sock == MINER_INVALID_SOCKET) return 9999;
+
+#ifdef _WIN32
+    u_long mode = 1;
+    ioctlsocket(sock, FIONBIO, &mode);
+#else
+    int flags = fcntl(sock, F_GETFL, 0);
+    fcntl(sock, F_SETFL, flags | O_NONBLOCK);
+#endif
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    inet_pton(AF_INET, ip, &addr.sin_addr);
+
+    int64_t start = get_time_ms();
+    connect(sock, (struct sockaddr*)&addr, sizeof(addr));
+
+    fd_set writefds;
+    FD_ZERO(&writefds);
+    FD_SET(sock, &writefds);
+
+    struct timeval tv = {1, 0};  /* 1 second timeout */
+    int ret = select((int)sock + 1, NULL, &writefds, NULL, &tv);
+
+#ifdef _WIN32
+    closesocket(sock);
+#else
+    close(sock);
+#endif
+
+    if (ret > 0) {
+        return (int)(get_time_ms() - start);
+    }
+    return 9999;
+}
+
 static void discover_nodes(void)
 {
     g_node_count = 0;
@@ -308,14 +350,18 @@ static void discover_nodes(void)
             inet_ntop(AF_INET, &addr->sin_addr, ip, sizeof(ip));
 
             if (ip_exists(ip)) continue;
-            if (is_local_ip(ip)) continue;  /* Skip own IP */
+            if (is_local_ip(ip)) continue;  /* Skip local interface IPs */
+
+            /* Test connectivity - skip unreachable nodes (including own external IP behind NAT) */
+            int latency = quick_connect_test(ip, RPC_PORT);
+            if (latency >= 5000) continue;  /* Skip if can't connect in 5s */
 
             strncpy(g_nodes[g_node_count].host, DNS_SEEDS[i], sizeof(g_nodes[g_node_count].host) - 1);
             strncpy(g_nodes[g_node_count].ip, ip, sizeof(g_nodes[g_node_count].ip) - 1);
             g_nodes[g_node_count].port = RPC_PORT;
-            g_nodes[g_node_count].latency_ms = 9999;
+            g_nodes[g_node_count].latency_ms = latency;
             g_nodes[g_node_count].active = true;
-            g_nodes[g_node_count].connected = false;
+            g_nodes[g_node_count].connected = true;
             g_nodes[g_node_count].height = 0;
             g_nodes[g_node_count].failures = 0;
             g_node_count++;
