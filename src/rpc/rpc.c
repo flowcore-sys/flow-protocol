@@ -1137,6 +1137,58 @@ static void rpc_getblocktemplate(ftc_rpc_server_t* rpc, ftc_json_t* json, const 
     ftc_block_free(block);
 }
 
+static void rpc_getblocksinfo(ftc_rpc_server_t* rpc, ftc_json_t* json, const char* id)
+{
+    if (!rpc->handlers || !rpc->handlers->get_data_dir || !rpc->handlers->get_best_height) {
+        rpc_error(json, -1, "Handler not available", id);
+        return;
+    }
+
+    const char* data_dir = rpc->handlers->get_data_dir(rpc->handlers->user_data);
+    if (!data_dir) {
+        rpc_error(json, -1, "Data directory not available", id);
+        return;
+    }
+
+    /* Build blocks.dat path */
+    char blocks_path[512];
+    snprintf(blocks_path, sizeof(blocks_path), "%s/blocks.dat", data_dir);
+
+    /* Get file info */
+    FILE* f = fopen(blocks_path, "rb");
+    if (!f) {
+        ftc_json_object_start(json);
+        ftc_json_kv_string(json, "jsonrpc", "2.0");
+        ftc_json_key(json, "result");
+        ftc_json_object_start(json);
+        ftc_json_kv_int(json, "blocks", 0);
+        ftc_json_kv_int(json, "size", 0);
+        ftc_json_kv_bool(json, "available", false);
+        ftc_json_object_end(json);
+        ftc_json_kv_string(json, "id", id);
+        ftc_json_object_end(json);
+        return;
+    }
+
+    fseek(f, 0, SEEK_END);
+    long file_size = ftell(f);
+    fclose(f);
+
+    uint32_t height = rpc->handlers->get_best_height(rpc->handlers->user_data);
+
+    ftc_json_object_start(json);
+    ftc_json_kv_string(json, "jsonrpc", "2.0");
+    ftc_json_key(json, "result");
+    ftc_json_object_start(json);
+    ftc_json_kv_uint(json, "blocks", height);
+    ftc_json_kv_int(json, "size", file_size);
+    ftc_json_kv_bool(json, "available", true);
+    ftc_json_kv_string(json, "url", "/blocks.dat");
+    ftc_json_object_end(json);
+    ftc_json_kv_string(json, "id", id);
+    ftc_json_object_end(json);
+}
+
 static void rpc_submitblock(ftc_rpc_server_t* rpc, ftc_json_t* json, const char* params, const char* id)
 {
     /* Parse block hex from params */
@@ -1258,6 +1310,8 @@ static void process_request(ftc_rpc_server_t* rpc, const char* request, ftc_json
         rpc_getblocktemplate(rpc, response, params ? params : "[]", id);
     } else if (strcmp(method, "submitblock") == 0) {
         rpc_submitblock(rpc, response, params ? params : "[]", id);
+    } else if (strcmp(method, "getblocksinfo") == 0) {
+        rpc_getblocksinfo(rpc, response, id);
     } else {
         rpc_error(response, -32601, "Method not found", id);
     }
@@ -1296,6 +1350,53 @@ static void handle_client(ftc_rpc_server_t* rpc, ftc_rpc_socket_t client)
         if (strstr(request, "\r\n\r\n")) break;
     }
     request[total] = '\0';
+
+    /* Check for GET /blocks.dat request (file download) */
+    if (strncmp(request, "GET /blocks.dat", 15) == 0) {
+        if (rpc->handlers && rpc->handlers->get_data_dir) {
+            const char* data_dir = rpc->handlers->get_data_dir(rpc->handlers->user_data);
+            if (data_dir) {
+                char blocks_path[512];
+                snprintf(blocks_path, sizeof(blocks_path), "%s/blocks.dat", data_dir);
+
+                FILE* f = fopen(blocks_path, "rb");
+                if (f) {
+                    fseek(f, 0, SEEK_END);
+                    long file_size = ftell(f);
+                    fseek(f, 0, SEEK_SET);
+
+                    char header[512];
+                    snprintf(header, sizeof(header),
+                             "HTTP/1.1 200 OK\r\n"
+                             "Content-Type: application/octet-stream\r\n"
+                             "Content-Disposition: attachment; filename=\"blocks.dat\"\r\n"
+                             "Content-Length: %ld\r\n"
+                             "Connection: close\r\n"
+                             "\r\n",
+                             file_size);
+                    send(client, header, (int)strlen(header), 0);
+
+                    /* Stream file in chunks */
+                    char buffer[65536];
+                    size_t bytes_read;
+                    while ((bytes_read = fread(buffer, 1, sizeof(buffer), f)) > 0) {
+                        send(client, buffer, (int)bytes_read, 0);
+                    }
+                    fclose(f);
+
+                    free(request);
+                    close_rpc_socket(client);
+                    return;
+                }
+            }
+        }
+        /* File not found */
+        const char* not_found = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        send(client, not_found, (int)strlen(not_found), 0);
+        free(request);
+        close_rpc_socket(client);
+        return;
+    }
 
     /* Find JSON body (after headers) */
     char* body = strstr(request, "\r\n\r\n");

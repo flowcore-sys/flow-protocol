@@ -215,8 +215,22 @@ Options:
   -rpcport <port>     RPC port (default: 17318)
   -port <port>        P2P port (default: 17317)
   -seed <host>        Add seed node manually
+  -bootstrap <url>    Download blocks.dat from existing node
   -nowallet           Disable wallet functionality
 ```
+
+### Fast Node Sync (Bootstrap)
+
+New nodes can quickly sync by downloading the blockchain from an existing node:
+
+```bash
+# Download blocks.dat from a seed node and start
+./ftc-node -bootstrap http://seed.flowprotocol.net:17318
+```
+
+This downloads the complete `blocks.dat` file (~2MB per 1000 blocks) instead of syncing block-by-block over P2P, reducing initial sync time from hours to minutes.
+
+If `blocks.dat` already exists, the bootstrap is skipped automatically.
 
 ### Port Forwarding
 
@@ -258,6 +272,7 @@ curl -X POST http://localhost:17318 \
 | `sendrawtransaction` | Broadcast signed transaction |
 | `getblocktemplate` | Get mining template |
 | `submitblock` | Submit mined block |
+| `getblocksinfo` | Get blocks.dat file info for sync |
 
 ### Example: Check Balance
 
@@ -270,6 +285,31 @@ curl -X POST http://seed.flowprotocol.net:17318 \
 Response:
 ```json
 {"jsonrpc":"2.0","result":1234.56789012,"id":"1"}
+```
+
+### Example: Get Blocks Info (for sync)
+
+```bash
+curl -X POST http://seed.flowprotocol.net:17318 \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","method":"getblocksinfo","params":[],"id":1}'
+```
+
+Response:
+```json
+{"jsonrpc":"2.0","result":{"blocks":7500,"size":1912512,"available":true,"url":"/blocks.dat"},"id":"1"}
+```
+
+### Download Blockchain File
+
+Nodes expose `blocks.dat` via HTTP for fast sync:
+
+```bash
+# Download blocks.dat directly
+curl -o blocks.dat http://seed.flowprotocol.net:17318/blocks.dat
+
+# Or use bootstrap flag (recommended)
+./ftc-node -bootstrap http://seed.flowprotocol.net:17318
 ```
 
 ---
@@ -350,6 +390,7 @@ curl -X POST http://localhost:17318 \
 - [x] UTXO model
 - [x] Difficulty adjustment
 - [x] Transaction validation
+- [x] Fast node sync (blocks.dat bootstrap)
 
 ### In Progress
 

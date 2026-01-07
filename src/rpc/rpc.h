@@ -70,6 +70,9 @@ typedef struct {
     ftc_block_t* (*get_block_template)(void* ctx, const ftc_address_t miner_addr);
     bool (*submit_block)(void* ctx, ftc_block_t* block);
 
+    /* Data directory (for blocks.dat sync) */
+    const char* (*get_data_dir)(void* ctx);
+
     /* User data */
     void* user_data;
 } ftc_rpc_handlers_t;

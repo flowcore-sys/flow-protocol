@@ -859,6 +859,12 @@ static bool rpc_submit_block(void* ctx, ftc_block_t* block)
     return true;
 }
 
+static const char* rpc_get_data_dir(void* ctx)
+{
+    ftc_node_t* node = (ftc_node_t*)ctx;
+    return node->config.data_dir;
+}
+
 /*==============================================================================
  * P2P CALLBACKS
  *============================================================================*/
@@ -1248,6 +1254,7 @@ bool ftc_node_start(ftc_node_t* node)
         .get_utxos = rpc_get_utxos,
         .get_block_template = rpc_get_block_template,
         .submit_block = rpc_submit_block,
+        .get_data_dir = rpc_get_data_dir,
     };
     rpc_handlers.user_data = node;
     ftc_rpc_set_handlers(node->rpc, &rpc_handlers);
