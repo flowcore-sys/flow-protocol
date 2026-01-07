@@ -20,10 +20,10 @@ extern "C" {
  * VERSION
  *============================================================================*/
 
-#define FTC_VERSION_MAJOR       1
+#define FTC_VERSION_MAJOR       2
 #define FTC_VERSION_MINOR       0
 #define FTC_VERSION_PATCH       0
-#define FTC_VERSION_STRING      "1.0.0"
+#define FTC_VERSION_STRING      "2.0.0"
 #define FTC_PROTOCOL_VERSION    70001
 
 /*==============================================================================
@@ -46,7 +46,7 @@ extern "C" {
 #define FTC_MAX_INBOUND         117
 
 #define FTC_MAX_MESSAGE_SIZE    (4 * 1024 * 1024)  /* 4MB */
-#define FTC_USER_AGENT          "/FTC:1.0.0/"
+#define FTC_USER_AGENT          "/FTC:2.0.0/"
 
 /*==============================================================================
  * SUPPLY & REWARDS

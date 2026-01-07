@@ -47,7 +47,7 @@ extern "C" {
  * CONSTANTS
  *============================================================================*/
 
-#define FTC_NODE_VERSION        "1.0.0"
+#define FTC_NODE_VERSION        "2.0.0"
 #define FTC_DATA_DIR            "ftcdata"
 #define FTC_BLOCKS_FILE         "blocks.dat"
 #define FTC_CHAIN_FILE          "chain.dat"

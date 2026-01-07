@@ -24,7 +24,7 @@ extern "C" {
 #define FTC_MAX_INV_COUNT       50000
 #define FTC_MAX_ADDR_COUNT      1000
 #define FTC_MAX_HEADERS_COUNT   2000
-#define FTC_USER_AGENT          "/FTC:1.0.0/"
+#define FTC_USER_AGENT          "/FTC:2.0.0/"
 
 /*==============================================================================
  * MESSAGE TYPES
