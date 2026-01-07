@@ -891,7 +891,10 @@ static void p2p_on_block(ftc_p2p_t* p2p, ftc_peer_t* peer, const ftc_block_t* bl
     free(data);
 
     if (block_copy) {
-        ftc_chain_add_block(node, block_copy);
+        if (ftc_chain_add_block(node, block_copy)) {
+            /* Relay to other peers for real-time sync */
+            ftc_p2p_broadcast_block(p2p, block_copy);
+        }
         ftc_block_free(block_copy);
     }
 }
@@ -910,7 +913,10 @@ static void p2p_on_tx(ftc_p2p_t* p2p, ftc_peer_t* peer, const ftc_tx_t* tx)
     free(data);
 
     if (tx_copy && ftc_node_validate_tx(node, tx_copy)) {
-        ftc_mempool_add(node->mempool, tx_copy, node->utxo_set, node->chain->best_height);
+        if (ftc_mempool_add(node->mempool, tx_copy, node->utxo_set, node->chain->best_height) == FTC_OK) {
+            /* Relay to other peers for real-time sync */
+            ftc_p2p_broadcast_tx(p2p, tx_copy);
+        }
     } else {
         ftc_tx_free(tx_copy);
     }
