@@ -146,7 +146,6 @@ typedef struct {
     uint32_t            prev_height;
 
     /* Auto-save state */
-    int64_t             last_save_time;
     uint32_t            last_save_height;
 
 } ftc_node_t;
