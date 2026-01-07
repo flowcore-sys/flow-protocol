@@ -1173,6 +1173,10 @@ bool ftc_node_start(ftc_node_t* node)
     snprintf(blocks_path, sizeof(blocks_path), "%s/blocks.dat", node->config.data_dir);
     ftc_chain_load(node, blocks_path);
 
+    /* Initialize auto-save state */
+    node->last_save_time = time(NULL);
+    node->last_save_height = node->chain->best_height;
+
     /* Setup P2P callbacks */
     static ftc_p2p_callbacks_t p2p_callbacks = {
         .on_peer_connected = p2p_on_peer_connected,
@@ -1252,6 +1256,26 @@ void ftc_node_poll(ftc_node_t* node)
 
     /* Update P2P height */
     ftc_p2p_set_height(node->p2p, node->chain->best_height);
+
+    /* Auto-save blockchain: every 100 blocks or every 5 minutes */
+    int64_t now = time(NULL);
+    uint32_t height = node->chain->best_height;
+    bool should_save = false;
+
+    if (height >= node->last_save_height + 100) {
+        should_save = true;  /* 100 new blocks */
+    } else if (now >= node->last_save_time + 300 && height > node->last_save_height) {
+        should_save = true;  /* 5 minutes passed and have new blocks */
+    }
+
+    if (should_save) {
+        char blocks_path[512];
+        snprintf(blocks_path, sizeof(blocks_path), "%s/blocks.dat", node->config.data_dir);
+        if (ftc_chain_save(node->chain, blocks_path)) {
+            node->last_save_time = now;
+            node->last_save_height = height;
+        }
+    }
 }
 
 /*==============================================================================
