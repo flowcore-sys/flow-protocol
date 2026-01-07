@@ -1151,8 +1151,11 @@ void ftc_p2p_poll(ftc_p2p_t* p2p, int timeout_ms)
         }
     }
 
-    /* Process peer events */
-    for (int i = 0; i < FTC_MAX_PEERS; i++) {
+    /* Process peer events - limit to prevent RPC starvation */
+    int peers_processed = 0;
+    const int max_peers_per_poll = 50;  /* Process max 50 peers per poll cycle */
+
+    for (int i = 0; i < FTC_MAX_PEERS && peers_processed < max_peers_per_poll; i++) {
         ftc_peer_t* peer = p2p->peers[i];
         if (!peer || peer->socket == FTC_INVALID_SOCKET) continue;
 
@@ -1169,11 +1172,13 @@ void ftc_p2p_poll(ftc_p2p_t* p2p, int timeout_ms)
             } else {
                 peer->disconnect_requested = true;
             }
+            peers_processed++;
         }
 
         /* Handle readable */
         if (FD_ISSET(peer->socket, &read_fds)) {
             handle_peer_data(p2p, peer);
+            peers_processed++;
         }
 
         /* Check for disconnect */

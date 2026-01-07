@@ -21,7 +21,7 @@ extern "C" {
  *============================================================================*/
 
 #define FTC_GPU_MAX_DEVICES     16
-#define FTC_GPU_BATCH_SIZE      (1 << 24)   /* 16M hashes per batch */
+#define FTC_GPU_BATCH_SIZE      (1 << 28)   /* 256M hashes per batch for max GPU utilization */
 #define FTC_GPU_WORK_SIZE       256         /* Work group size */
 
 /*==============================================================================

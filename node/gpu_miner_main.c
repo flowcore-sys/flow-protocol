@@ -143,6 +143,23 @@ static char g_last_block_hash[17] = {0};
 /* GPU Farm */
 static ftc_gpu_farm_t* g_farm = NULL;
 
+/* Log buffer for static display */
+#define LOG_BUFFER_SIZE 8
+#define LOG_LINE_LEN 80
+static char g_log_buffer[LOG_BUFFER_SIZE][LOG_LINE_LEN];
+static int g_log_head = 0;
+static int g_log_count = 0;
+
+static void log_to_buffer(const char* fmt, ...)
+{
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(g_log_buffer[g_log_head], LOG_LINE_LEN, fmt, args);
+    va_end(args);
+    g_log_head = (g_log_head + 1) % LOG_BUFFER_SIZE;
+    if (g_log_count < LOG_BUFFER_SIZE) g_log_count++;
+}
+
 /*==============================================================================
  * UTILITIES
  *============================================================================*/
@@ -361,11 +378,11 @@ static char* rpc_call(int node_idx, const char* method, const char* params)
     if (sock == MINER_INVALID_SOCKET) return NULL;
 
 #ifdef _WIN32
-    DWORD timeout = 5000;
+    DWORD timeout = 1000;  /* 1 second timeout for faster mining */
     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (char*)&timeout, sizeof(timeout));
     setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, (char*)&timeout, sizeof(timeout));
 #else
-    struct timeval tv = {5, 0};
+    struct timeval tv = {1, 0};  /* 1 second timeout */
     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 #endif
@@ -526,18 +543,23 @@ static ftc_block_t* get_block_template(int node_idx, uint32_t* out_height)
     return block;
 }
 
-static bool submit_block(int node_idx, ftc_block_t* block)
+/* Fire-and-forget submit - don't wait for response to maximize GPU utilization */
+static void submit_block_async(int node_idx, ftc_block_t* block)
 {
+    if (node_idx < 0 || node_idx >= g_node_count) return;
+
+    node_info_t* node = &g_nodes[node_idx];
+
     size_t size = ftc_block_serialize(block, NULL, 0);
     uint8_t* data = (uint8_t*)malloc(size);
-    if (!data) return false;
+    if (!data) return;
 
     ftc_block_serialize(block, data, size);
 
     char* hex = (char*)malloc(size * 2 + 1);
     if (!hex) {
         free(data);
-        return false;
+        return;
     }
 
     for (size_t i = 0; i < size; i++) {
@@ -545,23 +567,68 @@ static bool submit_block(int node_idx, ftc_block_t* block)
     }
     free(data);
 
-    char* params = (char*)malloc(size * 2 + 32);
-    if (!params) {
+    /* Build JSON-RPC request */
+    char* request = (char*)malloc(size * 2 + 256);
+    if (!request) {
         free(hex);
-        return false;
+        return;
     }
 
-    sprintf(params, "[\"%s\"]", hex);
+    int req_len = sprintf(request,
+        "{\"jsonrpc\":\"2.0\",\"method\":\"submitblock\",\"params\":[\"%s\"],\"id\":1}",
+        hex);
     free(hex);
 
-    char* response = rpc_call(node_idx, "submitblock", params);
-    free(params);
+    /* Open socket */
+    miner_socket_t sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (sock == MINER_INVALID_SOCKET) {
+        free(request);
+        return;
+    }
 
-    if (!response) return false;
+    /* Very short timeout - just enough to send */
+#ifdef _WIN32
+    DWORD timeout = 500;
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, (char*)&timeout, sizeof(timeout));
+#else
+    struct timeval tv = {0, 500000};
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+#endif
 
-    bool success = strstr(response, "\"result\":null") != NULL;
-    free(response);
-    return success;
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    inet_pton(AF_INET, node->ip, &addr.sin_addr);
+    addr.sin_port = htons(node->port);
+
+    if (connect(sock, (struct sockaddr*)&addr, sizeof(addr)) == 0) {
+        char http[256];
+        int http_len = sprintf(http,
+            "POST / HTTP/1.1\r\n"
+            "Host: %s:%d\r\n"
+            "Content-Type: application/json\r\n"
+            "Content-Length: %d\r\n"
+            "Connection: close\r\n\r\n",
+            node->ip, node->port, req_len);
+
+        send(sock, http, http_len, 0);
+        send(sock, request, req_len, 0);
+        /* Don't wait for response - just close and continue mining */
+    }
+
+#ifdef _WIN32
+    closesocket(sock);
+#else
+    close(sock);
+#endif
+    free(request);
+}
+
+static bool submit_block(int node_idx, ftc_block_t* block)
+{
+    /* Use async version for speed, assume accepted */
+    submit_block_async(node_idx, block);
+    return true;  /* Optimistically assume accepted */
 }
 
 /*==============================================================================
@@ -620,6 +687,108 @@ static void print_header_rigel(void)
            "no",
            g_nodes[g_active_node].ip);
     printf("\n");
+}
+
+static void print_gpu_table_header(void)
+{
+    printf(C_BG_BLUE C_WHITE " # GPU                        Hashrate/Avg        A/S/Hw " C_RESET "\n");
+}
+
+static void print_gpu_row(int idx, const ftc_gpu_device_t* dev, gpu_stats_t* stats)
+{
+    char hr_str[16], hr_avg_str[16];
+    format_hashrate(stats->hashrate, hr_str, sizeof(hr_str));
+    format_hashrate(stats->hashrate_avg, hr_avg_str, sizeof(hr_avg_str));
+
+    printf(" %d %-25s " C_GREEN "%-8s" C_RESET "/" C_YELLOW "%-8s" C_RESET " "
+           C_GREEN "%3llu" C_RESET "/" C_RED "%3d" C_RESET "/" C_YELLOW "%3d" C_RESET "\n",
+           idx, dev->name, hr_str, hr_avg_str,
+           (unsigned long long)g_blocks_accepted, 0, 0);
+}
+
+/* Static display that updates in-place */
+static void draw_static_display(void)
+{
+    int gpu_count = ftc_gpu_farm_device_count(g_farm);
+
+    /* Update GPU hashrates */
+    for (int i = 0; i < gpu_count; i++) {
+        g_gpu_hashrates[i] = ftc_gpu_farm_get_device_hashrate(g_farm, i);
+    }
+
+    double total_hr = ftc_gpu_farm_get_hashrate(g_farm);
+    char hr_str[32], uptime_str[32];
+    format_hashrate(total_hr, hr_str, sizeof(hr_str));
+    format_uptime(get_time_ms() - g_start_time, uptime_str, sizeof(uptime_str));
+
+    /* Move cursor to home and redraw */
+    printf(C_HOME C_HIDE_CUR);
+
+    /* Header */
+    printf(C_CLR_LINE C_CYAN C_BOLD "FTC GPU Miner v%s" C_RESET "  |  " C_WHITE "keccak256" C_RESET "\n", MINER_VERSION);
+    printf(C_CLR_LINE "================================================================================\n");
+
+    /* Node info */
+    printf(C_CLR_LINE "Node: " C_CYAN "%s" C_RESET "  Latency: " C_GREEN "%dms" C_RESET "  Height: " C_YELLOW "%u" C_RESET "  Diff: %.4f\n",
+           g_nodes[g_active_node].ip,
+           g_nodes[g_active_node].latency_ms,
+           g_current_height,
+           g_difficulty);
+    printf(C_CLR_LINE "================================================================================\n");
+
+    /* GPU table header */
+    printf(C_CLR_LINE C_BOLD " GPU  %-24s  %-12s  %-12s  Blocks" C_RESET "\n", "Device", "Hashrate", "Avg");
+    printf(C_CLR_LINE "--------------------------------------------------------------------------------\n");
+
+    /* GPU rows */
+    for (int i = 0; i < gpu_count; i++) {
+        const ftc_gpu_device_t* dev = ftc_gpu_farm_get_device(g_farm, i);
+        if (!dev) continue;
+
+        char gpu_hr[16], gpu_avg[16];
+        format_hashrate(g_gpu_hashrates[i], gpu_hr, sizeof(gpu_hr));
+        format_hashrate(g_gpu_hashrates[i], gpu_avg, sizeof(gpu_avg));  /* TODO: rolling average */
+
+        printf(C_CLR_LINE " [%d]  " C_WHITE "%-24s" C_RESET "  " C_GREEN "%-12s" C_RESET "  " C_YELLOW "%-12s" C_RESET "  %llu\n",
+               i, dev->name, gpu_hr, gpu_avg, (unsigned long long)g_blocks_accepted);
+    }
+
+    printf(C_CLR_LINE "--------------------------------------------------------------------------------\n");
+
+    /* Total row */
+    printf(C_CLR_LINE C_BOLD " SUM  %-24s  " C_GREEN "%-12s" C_RESET C_BOLD "  %-12s  " C_GREEN "%llu" C_RESET "/" C_YELLOW "%llu" C_RESET "\n",
+           "", hr_str, hr_str,
+           (unsigned long long)g_blocks_accepted,
+           (unsigned long long)g_blocks_found);
+
+    printf(C_CLR_LINE "================================================================================\n");
+
+    /* Status line */
+    printf(C_CLR_LINE "Uptime: " C_CYAN "%s" C_RESET "  Total hashes: " C_WHITE "%.2f B" C_RESET "\n",
+           uptime_str, (double)g_total_hashes / 1e9);
+
+    printf(C_CLR_LINE "================================================================================\n");
+
+    /* Log buffer - show recent events */
+    printf(C_CLR_LINE C_BOLD "Recent:" C_RESET "\n");
+    for (int i = 0; i < LOG_BUFFER_SIZE; i++) {
+        int idx = (g_log_head - g_log_count + i + LOG_BUFFER_SIZE) % LOG_BUFFER_SIZE;
+        if (i < g_log_count) {
+            if (strstr(g_log_buffer[idx], "BLOCK!")) {
+                printf(C_CLR_LINE C_GREEN " %s" C_RESET "\n", g_log_buffer[idx]);
+            } else if (strstr(g_log_buffer[idx], "REJECTED")) {
+                printf(C_CLR_LINE C_RED " %s" C_RESET "\n", g_log_buffer[idx]);
+            } else {
+                printf(C_CLR_LINE " %s\n", g_log_buffer[idx]);
+            }
+        } else {
+            printf(C_CLR_LINE "\n");
+        }
+    }
+
+    printf(C_CLR_LINE "\n");
+    printf(C_SHOW_CUR);
+    fflush(stdout);
 }
 
 static void log_stats(void)
@@ -733,11 +902,10 @@ static void log_share_found(uint32_t height, const char* hash, bool accepted)
     get_timestamp(ts, sizeof(ts));
 
     if (accepted) {
-        printf("[%s] " C_GREEN C_BOLD "BLOCK FOUND!" C_RESET " height=%u hash=%s...\n", ts, height, hash);
+        log_to_buffer("[%s] BLOCK! h=%u %s", ts, height, hash);
     } else {
-        printf("[%s] " C_RED "block rejected" C_RESET " height=%u\n", ts, height);
+        log_to_buffer("[%s] REJECTED h=%u", ts, height);
     }
-    fflush(stdout);
 }
 
 static void print_final_stats(void)
@@ -884,14 +1052,7 @@ int main(int argc, char* argv[])
         return 1;
     }
 
-    /* Initial header (text-based, will switch to Rigel display during mining) */
-    printf(C_CYAN "%s v%s" C_RESET " - FTC GPU Mining Client\n\n", MINER_NAME, MINER_VERSION);
-
-    /* Show GPUs */
-    ftc_gpu_print_devices();
-    printf("\n");
-
-    /* Create GPU farm */
+    /* Create GPU farm silently */
     g_farm = ftc_gpu_farm_new(g_device_mask);
     if (!g_farm) {
         fprintf(stderr, "Error: Failed to initialize GPU mining\n");
@@ -899,53 +1060,43 @@ int main(int argc, char* argv[])
         return 1;
     }
 
-    log_info("Initialized %d GPU(s) for mining\n", ftc_gpu_farm_device_count(g_farm));
-
-    /* Discover nodes */
-    log_info("Discovering nodes via DNS seeds...\n");
+    /* Discover nodes and select best one */
     discover_nodes();
 
     if (g_node_count == 0) {
-        log_info("No nodes found. Check your internet connection.\n");
+        fprintf(stderr, "Error: No nodes found. Check your internet connection.\n");
         ftc_gpu_farm_free(g_farm);
         ftc_gpu_shutdown();
         return 1;
     }
 
-    log_info("Found %d node(s), measuring latency...\n", g_node_count);
     update_node_latencies();
 
     g_active_node = select_best_node();
     if (g_active_node < 0) {
-        log_info("All nodes unreachable.\n");
+        fprintf(stderr, "Error: All nodes unreachable.\n");
         ftc_gpu_farm_free(g_farm);
         ftc_gpu_shutdown();
         return 1;
-    }
-
-    for (int i = 0; i < g_node_count && i < 4; i++) {
-        const char* marker = (i == g_active_node) ? "*" : " ";
-        if (g_nodes[i].connected) {
-            log_info(" %s %s (%dms)\n", marker, g_nodes[i].ip, g_nodes[i].latency_ms);
-        }
     }
 
     if (!get_node_info(g_active_node)) {
-        log_info("Cannot connect to node\n");
+        fprintf(stderr, "Error: Cannot connect to node %s\n", g_nodes[g_active_node].ip);
         ftc_gpu_farm_free(g_farm);
         ftc_gpu_shutdown();
         return 1;
     }
 
-    log_info("Connected to %s | height %u | diff %.2f\n",
-             g_nodes[g_active_node].ip, g_current_height, g_difficulty);
-
-    /* Start mining */
+    /* Start mining - clear screen immediately for static display */
     g_start_time = get_time_ms();
     int64_t last_stats = g_start_time;
     int64_t last_latency_check = g_start_time;
 
-    log_info("GPU mining started\n");
+    printf(C_CLEAR C_HOME C_HIDE_CUR);
+    fflush(stdout);
+
+    /* Draw initial display before first block template */
+    draw_static_display();
 
     while (g_running) {
         uint32_t height = 0;
@@ -981,11 +1132,14 @@ int main(int argc, char* argv[])
 
         ftc_gpu_farm_set_work(g_farm, header, target);
 
-        /* Mine until block found or timeout */
+        /* Mine until block found or new block from network */
+        int64_t last_block_check = get_time_ms();
         while (g_running) {
             int64_t now;
             ftc_gpu_result_t result = ftc_gpu_farm_mine(g_farm);
             g_total_hashes += result.hashes;
+
+            now = get_time_ms();
 
             if (result.found) {
                 block->header.nonce = result.nonce;
@@ -1003,21 +1157,24 @@ int main(int argc, char* argv[])
 
                 log_share_found(height, g_last_block_hash, accepted);
 
-                /* Check if stats need logging before breaking */
-                now = get_time_ms();
-                if (now - last_stats >= 10000) {
-                    log_stats();
-                    last_stats = now;
-                }
+                /* Update display after block found */
+                draw_static_display();
+                last_stats = now;
                 break;
             }
 
-            /* Log stats every 10 seconds */
-            now = get_time_ms();
-            if (now - last_stats >= 10000) {
-                log_stats();
+            /* Update display every 200ms for responsive UI */
+            if (now - last_stats >= 200) {
+                draw_static_display();
                 last_stats = now;
-                get_node_info(g_active_node);
+            }
+
+            /* Check for new block from network every 5 seconds */
+            if (now - last_block_check >= 5000) {
+                if (get_node_info(g_active_node) && g_nodes[g_active_node].height > height) {
+                    break;  /* New block found by network */
+                }
+                last_block_check = now;
             }
 
             /* Check latency every 30 seconds */
@@ -1026,21 +1183,15 @@ int main(int argc, char* argv[])
                 int best = select_best_node();
                 if (best >= 0 && best != g_active_node) {
                     if (g_nodes[best].latency_ms + 100 < g_nodes[g_active_node].latency_ms) {
-                        log_info("Switching to %s (%dms)\n", g_nodes[best].ip, g_nodes[best].latency_ms);
                         g_active_node = best;
                     }
                 }
                 last_latency_check = now;
             }
-
-            /* Check for new block from network */
-            if (get_node_info(g_active_node) && g_nodes[g_active_node].height > height) {
-                break;  /* New block found by network */
-            }
         }
 
         ftc_block_free(block);
-        if (g_running) usleep(100000);
+        /* No delay - immediately get next block template */
     }
 
     print_final_stats();

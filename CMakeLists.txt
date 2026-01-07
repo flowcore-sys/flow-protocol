@@ -153,8 +153,11 @@ if(FTC_BUILD_CUDA)
     set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Xcompiler=/wd4996")
     set(CMAKE_CUDA_FLAGS_RELEASE "-O3")
 
+    # Remove CMAKE_INTDIR from CUDA defines to fix nvcc quoting issue
+    set_property(TARGET ftc-cuda PROPERTY COMPILE_DEFINITIONS "")
+
     # Disable PDB for CUDA (fixes nvcc comma parsing bug)
-    set(CMAKE_CUDA_COMPILE_OBJECT "<CMAKE_CUDA_COMPILER> <DEFINES> <INCLUDES> <FLAGS> -c <SOURCE> -o <OBJECT>")
+    set(CMAKE_CUDA_COMPILE_OBJECT "<CMAKE_CUDA_COMPILER> <INCLUDES> <FLAGS> -c <SOURCE> -o <OBJECT>")
 endif()
 
 # OpenCL Support (AMD/Intel)

@@ -45,6 +45,8 @@ static void print_help(void)
     printf("\n");
 }
 
+#define MAX_CUSTOM_SEEDS 16
+
 int main(int argc, char* argv[])
 {
     ftc_node_config_t config;
@@ -56,8 +58,10 @@ int main(int argc, char* argv[])
         "seed1.flowprotocol.net",
         "seed2.flowprotocol.net",
     };
-    config.seeds = default_seeds;
-    config.seed_count = 3;
+
+    /* Custom seeds storage */
+    static const char* custom_seeds[MAX_CUSTOM_SEEDS];
+    int custom_seed_count = 0;
 
     /* Parse arguments */
     for (int i = 1; i < argc; i++) {
@@ -78,8 +82,11 @@ int main(int argc, char* argv[])
             config.testnet = true;
         }
         else if (strcmp(argv[i], "-seed") == 0 && i + 1 < argc) {
-            /* Would need dynamic allocation for custom seeds */
-            i++;
+            if (custom_seed_count < MAX_CUSTOM_SEEDS) {
+                custom_seeds[custom_seed_count++] = argv[++i];
+            } else {
+                printf("Warning: too many seeds, ignoring %s\n", argv[++i]);
+            }
         }
         else if (strcmp(argv[i], "-nowallet") == 0) {
             config.wallet_enabled = false;
@@ -89,6 +96,15 @@ int main(int argc, char* argv[])
             print_help();
             return 1;
         }
+    }
+
+    /* Use custom seeds if provided, otherwise use defaults */
+    if (custom_seed_count > 0) {
+        config.seeds = custom_seeds;
+        config.seed_count = custom_seed_count;
+    } else {
+        config.seeds = default_seeds;
+        config.seed_count = 3;
     }
 
     /* Create data directory */

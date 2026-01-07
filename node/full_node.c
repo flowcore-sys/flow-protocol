@@ -46,9 +46,58 @@ static ftc_chain_t* chain_new(void)
         return NULL;
     }
 
+    /* hash_index is already zeroed by calloc */
+
     FTC_MUTEX_INIT(chain->mutex);
 
     return chain;
+}
+
+/* Hash index helper functions for O(1) block lookups */
+static inline uint32_t hash_index_slot(const ftc_hash256_t hash)
+{
+    /* Use first 4 bytes of hash as index, masked to table size */
+    uint32_t slot = (hash[0] | (hash[1] << 8) | (hash[2] << 16) | (hash[3] << 24));
+    return slot & (FTC_HASH_INDEX_SIZE - 1);
+}
+
+static void hash_index_add(ftc_chain_t* chain, const ftc_hash256_t hash, int block_index)
+{
+    uint32_t slot = hash_index_slot(hash);
+
+    ftc_hash_entry_t* entry = (ftc_hash_entry_t*)malloc(sizeof(ftc_hash_entry_t));
+    if (!entry) return;
+
+    memcpy(entry->hash, hash, 32);
+    entry->block_index = block_index;
+    entry->next = chain->hash_index[slot];
+    chain->hash_index[slot] = entry;
+}
+
+static int hash_index_find(ftc_chain_t* chain, const ftc_hash256_t hash)
+{
+    uint32_t slot = hash_index_slot(hash);
+
+    ftc_hash_entry_t* entry = chain->hash_index[slot];
+    while (entry) {
+        if (memcmp(entry->hash, hash, 32) == 0) {
+            return entry->block_index;
+        }
+        entry = entry->next;
+    }
+    return -1;  /* Not found */
+}
+
+static void hash_index_free(ftc_chain_t* chain)
+{
+    for (int i = 0; i < FTC_HASH_INDEX_SIZE; i++) {
+        ftc_hash_entry_t* entry = chain->hash_index[i];
+        while (entry) {
+            ftc_hash_entry_t* next = entry->next;
+            free(entry);
+            entry = next;
+        }
+    }
 }
 
 static void chain_free(ftc_chain_t* chain)
@@ -56,6 +105,9 @@ static void chain_free(ftc_chain_t* chain)
     if (!chain) return;
 
     FTC_MUTEX_DESTROY(chain->mutex);
+
+    /* Free hash index */
+    hash_index_free(chain);
 
     for (int i = 0; i < chain->block_count; i++) {
         if (chain->blocks[i]) {
@@ -69,6 +121,177 @@ static void chain_free(ftc_chain_t* chain)
     }
 
     free(chain);
+}
+
+/*==============================================================================
+ * BLOCKCHAIN PERSISTENCE
+ *============================================================================*/
+
+#define FTC_BLOCKS_MAGIC 0x42435446  /* "FTCB" */
+#define FTC_BLOCKS_VERSION 1
+
+static bool ftc_chain_save(ftc_chain_t* chain, const char* path)
+{
+    FTC_MUTEX_LOCK(chain->mutex);
+
+    uint32_t count = (uint32_t)chain->block_count;
+
+    /* Don't overwrite file if we have fewer blocks than originally loaded */
+    if (chain->loaded_block_count > 0 && count < chain->loaded_block_count) {
+        printf("[NODE] Skipping save: have %u blocks but file had %u\n",
+               count, chain->loaded_block_count);
+        FTC_MUTEX_UNLOCK(chain->mutex);
+        return false;
+    }
+
+    /* Write to temp file first for atomic save */
+    char temp_path[520];
+    snprintf(temp_path, sizeof(temp_path), "%s.tmp", path);
+
+    FILE* f = fopen(temp_path, "wb");
+    if (!f) {
+        printf("[NODE] Failed to open %s for writing\n", temp_path);
+        FTC_MUTEX_UNLOCK(chain->mutex);
+        return false;
+    }
+
+    /* Write header */
+    uint32_t magic = FTC_BLOCKS_MAGIC;
+    uint32_t version = FTC_BLOCKS_VERSION;
+
+    fwrite(&magic, 4, 1, f);
+    fwrite(&version, 4, 1, f);
+    fwrite(&count, 4, 1, f);
+
+    /* Write blocks (skip genesis at index 0, it's regenerated) */
+    for (int i = 1; i < chain->block_count; i++) {
+        ftc_block_t* block = chain->blocks[i];
+        if (!block) continue;
+
+        size_t block_size = ftc_block_serialize(block, NULL, 0);
+        uint8_t* block_data = (uint8_t*)malloc(block_size);
+        if (!block_data) {
+            FTC_MUTEX_UNLOCK(chain->mutex);
+            fclose(f);
+            remove(temp_path);
+            return false;
+        }
+
+        ftc_block_serialize(block, block_data, block_size);
+
+        uint32_t size32 = (uint32_t)block_size;
+        fwrite(&size32, 4, 1, f);
+        fwrite(block_data, 1, block_size, f);
+
+        free(block_data);
+    }
+
+    /* Flush to disk before rename */
+    fflush(f);
+    fclose(f);
+
+    /* Atomic rename: remove old file and rename temp */
+    remove(path);
+    if (rename(temp_path, path) != 0) {
+        printf("[NODE] Failed to rename %s to %s\n", temp_path, path);
+        return false;
+    }
+
+    /* Update loaded count to allow future saves */
+    chain->loaded_block_count = count;
+
+    FTC_MUTEX_UNLOCK(chain->mutex);
+
+    printf("[NODE] Saved %u blocks to %s\n", count, path);
+    return true;
+}
+
+static int ftc_chain_load(ftc_node_t* node, const char* path)
+{
+    FILE* f = fopen(path, "rb");
+    if (!f) {
+        /* No saved blockchain - start fresh */
+        return 0;
+    }
+
+    /* Read header */
+    uint32_t magic, version, count;
+    if (fread(&magic, 4, 1, f) != 1 || magic != FTC_BLOCKS_MAGIC) {
+        printf("[NODE] Invalid blocks.dat magic\n");
+        fclose(f);
+        return -1;
+    }
+
+    if (fread(&version, 4, 1, f) != 1 || version != FTC_BLOCKS_VERSION) {
+        printf("[NODE] Unsupported blocks.dat version\n");
+        fclose(f);
+        return -1;
+    }
+
+    if (fread(&count, 4, 1, f) != 1) {
+        printf("[NODE] Failed to read block count\n");
+        fclose(f);
+        return -1;
+    }
+
+    printf("[NODE] Loading %u blocks from %s...\n", count, path);
+
+    int loaded = 0;
+
+    /* Read blocks (count includes genesis which we skip) */
+    for (uint32_t i = 1; i < count; i++) {
+        uint32_t size32;
+        if (fread(&size32, 4, 1, f) != 1) {
+            printf("[NODE] Failed to read block %u size\n", i);
+            break;
+        }
+
+        uint8_t* block_data = (uint8_t*)malloc(size32);
+        if (!block_data) {
+            printf("[NODE] Out of memory loading block %u\n", i);
+            break;
+        }
+
+        if (fread(block_data, 1, size32, f) != size32) {
+            printf("[NODE] Failed to read block %u data\n", i);
+            free(block_data);
+            break;
+        }
+
+        ftc_block_t* block = ftc_block_deserialize(block_data, size32);
+        free(block_data);
+
+        if (!block) {
+            printf("[NODE] Failed to deserialize block %u\n", i);
+            break;
+        }
+
+        /* Add block to chain (validates and updates UTXO) */
+        if (ftc_chain_add_block(node, block)) {
+            loaded++;
+        } else {
+            ftc_hash256_t hash;
+            ftc_block_hash(block, hash);
+            char hex[65];
+            ftc_hash_to_hex(hash, hex);
+            printf("[NODE] Block %u rejected: %s\n", i, hex);
+        }
+
+        ftc_block_free(block);
+
+        /* Progress every 1000 blocks */
+        if (loaded % 1000 == 0 && loaded > 0) {
+            printf("[NODE] Loaded %d blocks...\n", loaded);
+        }
+    }
+
+    fclose(f);
+    printf("[NODE] Loaded %d blocks from disk\n", loaded);
+
+    /* Remember how many blocks were in the file to prevent data loss */
+    node->chain->loaded_block_count = count;
+
+    return loaded;
 }
 
 bool ftc_chain_init(ftc_chain_t* chain)
@@ -111,6 +334,9 @@ bool ftc_chain_init(ftc_chain_t* chain)
 
     ftc_block_hash(genesis, chain->best_hash);
 
+    /* Add genesis to hash index */
+    hash_index_add(chain, chain->best_hash, 0);
+
     return true;
 }
 
@@ -118,12 +344,49 @@ bool ftc_chain_add_block(ftc_node_t* node, ftc_block_t* block)
 {
     ftc_chain_t* chain = node->chain;
 
-    /* Lock for thread safety */
+    /* Compute block hash ONCE before any lock */
+    ftc_hash256_t block_hash;
+    ftc_block_hash(block, block_hash);
+
+    /* Quick duplicate check with short lock */
     FTC_MUTEX_LOCK(chain->mutex);
+    int existing = hash_index_find(chain, block_hash);
+    if (existing >= 0) {
+        /* Block already exists - reject silently */
+        FTC_MUTEX_UNLOCK(chain->mutex);
+        return false;
+    }
+    FTC_MUTEX_UNLOCK(chain->mutex);
+
+    /* Clone block OUTSIDE the lock - this is slow */
+    size_t block_size = ftc_block_serialize(block, NULL, 0);
+    uint8_t* block_data = (uint8_t*)malloc(block_size);
+    if (!block_data) {
+        return false;
+    }
+    ftc_block_serialize(block, block_data, block_size);
+    ftc_block_t* block_copy = ftc_block_deserialize(block_data, block_size);
+    free(block_data);
+
+    if (!block_copy) {
+        return false;
+    }
+
+    /* Now acquire lock for the critical section */
+    FTC_MUTEX_LOCK(chain->mutex);
+
+    /* Double-check after re-acquiring lock (another thread might have added it) */
+    existing = hash_index_find(chain, block_hash);
+    if (existing >= 0) {
+        FTC_MUTEX_UNLOCK(chain->mutex);
+        ftc_block_free(block_copy);
+        return false;
+    }
 
     /* Validate block */
     if (!ftc_node_validate_block(node, block)) {
         FTC_MUTEX_UNLOCK(chain->mutex);
+        ftc_block_free(block_copy);
         return false;
     }
 
@@ -134,31 +397,19 @@ bool ftc_chain_add_block(ftc_node_t* node, ftc_block_t* block)
         if (!new_blocks) {
             printf("[NODE] Failed to expand block storage\n");
             FTC_MUTEX_UNLOCK(chain->mutex);
+            ftc_block_free(block_copy);
             return false;
         }
         chain->blocks = new_blocks;
         chain->block_capacity = new_cap;
     }
 
-    /* Clone block */
-    size_t block_size = ftc_block_serialize(block, NULL, 0);
-    uint8_t* block_data = (uint8_t*)malloc(block_size);
-    if (!block_data) {
-        FTC_MUTEX_UNLOCK(chain->mutex);
-        return false;
-    }
-    ftc_block_serialize(block, block_data, block_size);
-    ftc_block_t* block_copy = ftc_block_deserialize(block_data, block_size);
-    free(block_data);
-
-    if (!block_copy) {
-        FTC_MUTEX_UNLOCK(chain->mutex);
-        return false;
-    }
-
     chain->blocks[chain->block_count++] = block_copy;
     chain->best_height++;
-    ftc_block_hash(block, chain->best_hash);
+    memcpy(chain->best_hash, block_hash, 32);
+
+    /* Add to hash index for O(1) lookups */
+    hash_index_add(chain, block_hash, chain->block_count - 1);
 
     /* Update UTXO set */
     for (uint32_t i = 0; i < block->tx_count; i++) {
@@ -199,22 +450,31 @@ bool ftc_chain_add_block(ftc_node_t* node, ftc_block_t* block)
         ftc_mempool_remove(node->mempool, txid);
     }
 
+    int current_height = chain->best_height;
     FTC_MUTEX_UNLOCK(chain->mutex);
+
+    /* Auto-save every 100 blocks */
+    if (current_height > 0 && current_height % 100 == 0) {
+        char blocks_path[512];
+        snprintf(blocks_path, sizeof(blocks_path), "%s/blocks.dat", node->config.data_dir);
+        ftc_chain_save(chain, blocks_path);
+    }
+
     return true;
 }
 
 ftc_block_t* ftc_chain_get_block(ftc_chain_t* chain, const ftc_hash256_t hash)
 {
     FTC_MUTEX_LOCK(chain->mutex);
-    for (int i = 0; i < chain->block_count; i++) {
-        ftc_hash256_t block_hash;
-        ftc_block_hash(chain->blocks[i], block_hash);
-        if (memcmp(block_hash, hash, 32) == 0) {
-            ftc_block_t* block = chain->blocks[i];
-            FTC_MUTEX_UNLOCK(chain->mutex);
-            return block;
-        }
+
+    /* O(1) lookup using hash index */
+    int index = hash_index_find(chain, hash);
+    if (index >= 0 && index < chain->block_count) {
+        ftc_block_t* block = chain->blocks[index];
+        FTC_MUTEX_UNLOCK(chain->mutex);
+        return block;
     }
+
     FTC_MUTEX_UNLOCK(chain->mutex);
     return NULL;
 }
@@ -630,9 +890,19 @@ static void p2p_on_block(ftc_p2p_t* p2p, ftc_peer_t* peer, const ftc_block_t* bl
 
     ftc_hash256_t hash;
     ftc_block_hash(block, hash);
+
+    /* Quick duplicate check BEFORE expensive clone */
+    FTC_MUTEX_LOCK(node->chain->mutex);
+    int existing = hash_index_find(node->chain, hash);
+    FTC_MUTEX_UNLOCK(node->chain->mutex);
+
+    if (existing >= 0) {
+        /* Already have this block - skip silently */
+        return;
+    }
+
     char hex[65];
     ftc_hash_to_hex(hash, hex);
-
     printf("[NODE] Received block: %s\n", hex);
 
     /* Clone block (const removal) */
@@ -887,6 +1157,13 @@ void ftc_node_free(ftc_node_t* node)
 
     ftc_node_stop(node);
 
+    /* Save blockchain to disk */
+    if (node->chain && node->chain->block_count > 1) {
+        char blocks_path[512];
+        snprintf(blocks_path, sizeof(blocks_path), "%s/blocks.dat", node->config.data_dir);
+        ftc_chain_save(node->chain, blocks_path);
+    }
+
     if (node->wallet) {
         char wallet_path[512];
         snprintf(wallet_path, sizeof(wallet_path), "%s/wallet.dat", node->config.data_dir);
@@ -921,6 +1198,15 @@ bool ftc_node_start(ftc_node_t* node)
     char hex[65];
     ftc_hash_to_hex(genesis_hash, hex);
     printf("[NODE] Genesis block: %s\n", hex);
+
+    /* Load blockchain from disk */
+    char blocks_path[512];
+    snprintf(blocks_path, sizeof(blocks_path), "%s/blocks.dat", node->config.data_dir);
+    int loaded = ftc_chain_load(node, blocks_path);
+    if (loaded > 0) {
+        printf("[NODE] Blockchain restored: %d blocks, height=%d\n",
+               node->chain->block_count, node->chain->best_height);
+    }
 
     /* Setup P2P callbacks */
     static ftc_p2p_callbacks_t p2p_callbacks = {

@@ -82,11 +82,23 @@ typedef struct {
  * BLOCKCHAIN STATE
  *============================================================================*/
 
+/* Hash index for O(1) block lookups */
+#define FTC_HASH_INDEX_SIZE 8192  /* Must be power of 2 */
+
+typedef struct ftc_hash_entry {
+    ftc_hash256_t           hash;
+    int                     block_index;  /* Index into blocks array */
+    struct ftc_hash_entry*  next;         /* For collision chaining */
+} ftc_hash_entry_t;
+
 typedef struct {
     /* Block storage (simple in-memory for now) */
     ftc_block_t**   blocks;
     int             block_count;
     int             block_capacity;
+
+    /* Hash index for O(1) lookups */
+    ftc_hash_entry_t* hash_index[FTC_HASH_INDEX_SIZE];
 
     /* Best chain */
     ftc_hash256_t   best_hash;
@@ -98,6 +110,9 @@ typedef struct {
 
     /* Thread safety */
     ftc_mutex_t     mutex;
+
+    /* Persistence protection: don't save if we have fewer blocks than loaded */
+    uint32_t        loaded_block_count;
 
 } ftc_chain_t;
 

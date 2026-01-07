@@ -1265,6 +1265,17 @@ static void process_request(ftc_rpc_server_t* rpc, const char* request, ftc_json
 
 static void handle_client(ftc_rpc_server_t* rpc, ftc_rpc_socket_t client)
 {
+    /* Set receive timeout to prevent blocking */
+#ifdef _WIN32
+    DWORD timeout = 3000;  /* 3 seconds */
+    setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout));
+#else
+    struct timeval tv;
+    tv.tv_sec = 3;
+    tv.tv_usec = 0;
+    setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+#endif
+
     /* Use smaller buffer and dynamic allocation to avoid stack overflow */
     size_t request_capacity = 65536;  /* Start with 64KB */
     char* request = (char*)malloc(request_capacity);
