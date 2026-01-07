@@ -151,15 +151,20 @@ if(FTC_BUILD_CUDA)
     # Set CUDA architectures (CUDA 13+ requires compute_75+)
     set_target_properties(ftc-cuda PROPERTIES CUDA_ARCHITECTURES "89")
 
-    # Fix CUDA 13.x nvcc issues with MSVC flags
-    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Xcompiler=/wd4996")
-    set(CMAKE_CUDA_FLAGS_RELEASE "-O3")
-
-    # Remove CMAKE_INTDIR from CUDA defines to fix nvcc quoting issue
-    set_property(TARGET ftc-cuda PROPERTY COMPILE_DEFINITIONS "")
-
-    # Disable PDB for CUDA (fixes nvcc comma parsing bug)
-    set(CMAKE_CUDA_COMPILE_OBJECT "<CMAKE_CUDA_COMPILER> <INCLUDES> <FLAGS> -c <SOURCE> -o <OBJECT>")
+    # Platform-specific CUDA flags
+    if(WIN32)
+        # Fix CUDA 13.x nvcc issues with MSVC flags
+        set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Xcompiler=/wd4996")
+        set(CMAKE_CUDA_FLAGS_RELEASE "-O3")
+        # Remove CMAKE_INTDIR from CUDA defines to fix nvcc quoting issue
+        set_property(TARGET ftc-cuda PROPERTY COMPILE_DEFINITIONS "")
+        # Disable PDB for CUDA (fixes nvcc comma parsing bug)
+        set(CMAKE_CUDA_COMPILE_OBJECT "<CMAKE_CUDA_COMPILER> <INCLUDES> <FLAGS> -c <SOURCE> -o <OBJECT>")
+    else()
+        # Linux: minimal flags, avoid passing gcc flags to nvcc
+        set(CMAKE_CUDA_FLAGS "-O3")
+        set_target_properties(ftc-cuda PROPERTIES CUDA_STANDARD 17)
+    endif()
 endif()
 
 # OpenCL Support (AMD/Intel)
