@@ -232,12 +232,6 @@ add_executable(ftc-node
 )
 target_link_libraries(ftc-node ftc-core)
 
-# Standalone CPU miner
-add_executable(ftc-miner
-    node/miner_node.c
-)
-target_link_libraries(ftc-miner ftc-core)
-
 #==============================================================================
 # Tests
 #==============================================================================
