@@ -129,6 +129,8 @@ endif()
 
 # CUDA Support (NVIDIA)
 if(FTC_BUILD_CUDA)
+    # Set default CUDA architectures to suppress CMP0104 warning
+    set(CMAKE_CUDA_ARCHITECTURES "75;86;89" CACHE STRING "CUDA architectures")
     enable_language(CUDA)
     find_package(CUDAToolkit REQUIRED)
 
