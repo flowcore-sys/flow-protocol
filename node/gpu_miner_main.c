@@ -1123,6 +1123,9 @@ int main(int argc, char* argv[])
 
         g_current_height = height;
 
+        /* Update node info (difficulty, etc) on each new block */
+        get_node_info(g_active_node);
+
         /* Prepare work */
         uint8_t header[80];
         ftc_block_header_serialize(&block->header, header);
