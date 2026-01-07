@@ -294,7 +294,6 @@ bool ftc_p2p_start(ftc_p2p_t* p2p, uint16_t port)
     p2p->listening = true;
     p2p->running = true;
 
-    printf("[P2P] Listening on port %d\n", port);
     return true;
 }
 
@@ -319,6 +318,15 @@ void ftc_p2p_stop(ftc_p2p_t* p2p)
 void ftc_p2p_set_height(ftc_p2p_t* p2p, uint32_t height)
 {
     p2p->best_height = height;
+}
+
+void ftc_p2p_connect_all_seeds(ftc_p2p_t* p2p)
+{
+    if (!p2p || p2p->seed_count == 0) return;
+
+    for (int i = 0; i < p2p->seed_count && p2p->outbound_count < FTC_MAX_OUTBOUND; i++) {
+        ftc_p2p_connect(p2p, p2p->seed_nodes[i], FTC_P2P_PORT);
+    }
 }
 
 /*==============================================================================
@@ -381,7 +389,6 @@ ftc_peer_t* ftc_p2p_connect(ftc_p2p_t* p2p, const char* host, uint16_t port)
         }
     }
 
-    printf("[P2P] Connecting to %s:%d\n", peer->ip_str, port);
     return peer;
 }
 
@@ -393,7 +400,6 @@ void ftc_p2p_disconnect(ftc_p2p_t* p2p, ftc_peer_t* peer)
         p2p->callbacks->on_peer_disconnected(p2p, peer);
     }
 
-    printf("[P2P] Disconnected: %s\n", peer->ip_str);
     remove_peer(p2p, peer);
 }
 
@@ -471,20 +477,18 @@ bool ftc_peer_send_pong(ftc_peer_t* peer, uint64_t nonce)
 
 bool ftc_peer_send_getaddr(ftc_peer_t* peer)
 {
-    uint8_t msg[32];
-    size_t len = ftc_msg_getaddr_build(msg, sizeof(msg));
-    return ftc_peer_send(peer, msg, len);
+    /* DISABLED: No peer address exchange - use DNS seeds only */
+    (void)peer;
+    return true;
 }
 
 bool ftc_peer_send_addr(ftc_peer_t* peer, const ftc_net_addr_t* addrs, size_t count)
 {
-    uint8_t* msg = (uint8_t*)malloc(24 + 9 + count * 30);
-    if (!msg) return false;
-
-    size_t len = ftc_msg_addr_build(addrs, count, msg, 24 + 9 + count * 30);
-    bool ok = ftc_peer_send(peer, msg, len);
-    free(msg);
-    return ok;
+    /* DISABLED: No peer address exchange - use DNS seeds only */
+    (void)peer;
+    (void)addrs;
+    (void)count;
+    return true;
 }
 
 bool ftc_peer_send_inv(ftc_peer_t* peer, const ftc_inv_t* inv, size_t count)
@@ -638,7 +642,6 @@ static void process_version(ftc_p2p_t* p2p, ftc_peer_t* peer, const uint8_t* pay
 
     /* Check for self-connection */
     if (peer->nonce == p2p->local_nonce) {
-        printf("[P2P] Self-connection detected, disconnecting\n");
         peer->disconnect_requested = true;
         return;
     }
@@ -679,9 +682,6 @@ static void process_version(ftc_p2p_t* p2p, ftc_peer_t* peer, const uint8_t* pay
         peer->relay = payload[pos] != 0;
     }
 
-    printf("[P2P] Received version from %s: %s height=%d\n",
-           peer->ip_str, peer->user_agent, peer->start_height);
-
     /* Send verack */
     ftc_peer_send_verack(peer);
 
@@ -694,7 +694,6 @@ static void process_version(ftc_p2p_t* p2p, ftc_peer_t* peer, const uint8_t* pay
     /* If we've sent our version, check if handshake is complete */
     if (peer->state == FTC_PEER_VERSION_SENT) {
         peer->state = FTC_PEER_HANDSHAKED;
-        printf("[P2P] Handshake complete with %s\n", peer->ip_str);
 
         if (p2p->callbacks && p2p->callbacks->on_peer_connected) {
             p2p->callbacks->on_peer_connected(p2p, peer);
@@ -712,7 +711,6 @@ static void process_verack(ftc_p2p_t* p2p, ftc_peer_t* peer)
 {
     if (peer->state == FTC_PEER_VERSION_SENT) {
         peer->state = FTC_PEER_HANDSHAKED;
-        printf("[P2P] Handshake complete with %s\n", peer->ip_str);
 
         if (p2p->callbacks && p2p->callbacks->on_peer_connected) {
             p2p->callbacks->on_peer_connected(p2p, peer);
@@ -854,41 +852,11 @@ static void process_headers(ftc_p2p_t* p2p, ftc_peer_t* peer, const uint8_t* pay
 
 static void process_addr(ftc_p2p_t* p2p, ftc_peer_t* peer, const uint8_t* payload, size_t len)
 {
-    if (len < 1) return;
-
-    uint64_t count;
-    size_t pos = ftc_varint_decode(payload, len, &count);
-
-    if (count > FTC_MAX_ADDR_COUNT || pos + count * 30 > len) return;
-
-    ftc_net_addr_t* addrs = (ftc_net_addr_t*)malloc(count * sizeof(ftc_net_addr_t));
-    if (!addrs) return;
-
-    for (size_t i = 0; i < count; i++) {
-        /* Skip timestamp (4 bytes) */
-        pos += 4;
-
-        /* Services */
-        addrs[i].services = 0;
-        for (int j = 0; j < 8; j++) {
-            addrs[i].services |= ((uint64_t)payload[pos + j] << (j * 8));
-        }
-        pos += 8;
-
-        /* IP */
-        memcpy(addrs[i].ip, payload + pos, 16);
-        pos += 16;
-
-        /* Port (big-endian) */
-        addrs[i].port = ((uint16_t)payload[pos] << 8) | payload[pos + 1];
-        pos += 2;
-    }
-
-    if (p2p->callbacks && p2p->callbacks->on_addr) {
-        p2p->callbacks->on_addr(p2p, peer, addrs, (size_t)count);
-    }
-
-    free(addrs);
+    /* DISABLED: No peer address exchange - use DNS seeds only for node discovery */
+    (void)p2p;
+    (void)peer;
+    (void)payload;
+    (void)len;
 }
 
 static void process_getheaders(ftc_p2p_t* p2p, ftc_peer_t* peer, const uint8_t* payload, size_t len)
@@ -960,7 +928,7 @@ static void process_message(ftc_p2p_t* p2p, ftc_peer_t* peer, const ftc_msg_head
             process_addr(p2p, peer, payload, header->length);
             break;
         case FTC_MSG_GETADDR:
-            /* TODO: respond with known addresses */
+            /* DISABLED: No peer address exchange - use DNS seeds only */
             break;
         case FTC_MSG_GETHEADERS:
             process_getheaders(p2p, peer, payload, header->length);
@@ -1077,7 +1045,6 @@ void ftc_p2p_poll(ftc_p2p_t* p2p, int timeout_ms)
         /* Try to connect to seed nodes if we have no outbound connections */
         if (p2p->outbound_count < FTC_MAX_OUTBOUND && p2p->seed_count > 0) {
             int idx = rand() % p2p->seed_count;
-            printf("[P2P] Connecting to seed: %s\n", p2p->seed_nodes[idx]);
             ftc_p2p_connect(p2p, p2p->seed_nodes[idx], FTC_P2P_PORT);
         }
 
@@ -1089,7 +1056,6 @@ void ftc_p2p_poll(ftc_p2p_t* p2p, int timeout_ms)
             /* Connection timeout */
             if (peer->state == FTC_PEER_CONNECTING &&
                 now - peer->connect_time > FTC_CONNECT_TIMEOUT) {
-                printf("[P2P] Connection timeout: %s\n", peer->ip_str);
                 ftc_p2p_disconnect(p2p, peer);
                 continue;
             }
@@ -1097,7 +1063,6 @@ void ftc_p2p_poll(ftc_p2p_t* p2p, int timeout_ms)
             /* Handshake timeout */
             if (peer->state < FTC_PEER_HANDSHAKED &&
                 now - peer->connect_time > FTC_HANDSHAKE_TIMEOUT) {
-                printf("[P2P] Handshake timeout: %s\n", peer->ip_str);
                 ftc_p2p_disconnect(p2p, peer);
                 continue;
             }
@@ -1105,7 +1070,6 @@ void ftc_p2p_poll(ftc_p2p_t* p2p, int timeout_ms)
             /* Ping/timeout for active peers */
             if (peer->state >= FTC_PEER_HANDSHAKED) {
                 if (now - peer->last_recv > FTC_PEER_TIMEOUT) {
-                    printf("[P2P] Peer timeout: %s\n", peer->ip_str);
                     ftc_p2p_disconnect(p2p, peer);
                     continue;
                 }
@@ -1140,7 +1104,6 @@ void ftc_p2p_poll(ftc_p2p_t* p2p, int timeout_ms)
                 ftc_parse_address(peer->ip_str, ntohs(addr.sin_port), &peer->addr);
 
                 set_nonblocking(peer->socket);
-                printf("[P2P] Accepted connection from %s\n", peer->ip_str);
 
                 /* Inbound: wait for their version first */
             } else {
@@ -1167,7 +1130,6 @@ void ftc_p2p_poll(ftc_p2p_t* p2p, int timeout_ms)
 
             if (err == 0) {
                 peer->state = FTC_PEER_CONNECTED;
-                printf("[P2P] Connected to %s\n", peer->ip_str);
                 ftc_peer_send_version(p2p, peer);
             } else {
                 peer->disconnect_requested = true;

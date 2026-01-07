@@ -202,7 +202,6 @@ static bool ftc_chain_save(ftc_chain_t* chain, const char* path)
 
     FTC_MUTEX_UNLOCK(chain->mutex);
 
-    printf("[NODE] Saved %u blocks to %s\n", count, path);
     return true;
 }
 
@@ -234,7 +233,7 @@ static int ftc_chain_load(ftc_node_t* node, const char* path)
         return -1;
     }
 
-    printf("[NODE] Loading %u blocks from %s...\n", count, path);
+    /* Loading blocks silently for clean dashboard */
 
     int loaded = 0;
 
@@ -278,15 +277,9 @@ static int ftc_chain_load(ftc_node_t* node, const char* path)
         }
 
         ftc_block_free(block);
-
-        /* Progress every 1000 blocks */
-        if (loaded % 1000 == 0 && loaded > 0) {
-            printf("[NODE] Loaded %d blocks...\n", loaded);
-        }
     }
 
     fclose(f);
-    printf("[NODE] Loaded %d blocks from disk\n", loaded);
 
     /* Remember how many blocks were in the file to prevent data loss */
     node->chain->loaded_block_count = count;
@@ -450,16 +443,9 @@ bool ftc_chain_add_block(ftc_node_t* node, ftc_block_t* block)
         ftc_mempool_remove(node->mempool, txid);
     }
 
-    int current_height = chain->best_height;
     FTC_MUTEX_UNLOCK(chain->mutex);
 
-    /* Auto-save every 100 blocks */
-    if (current_height > 0 && current_height % 100 == 0) {
-        char blocks_path[512];
-        snprintf(blocks_path, sizeof(blocks_path), "%s/blocks.dat", node->config.data_dir);
-        ftc_chain_save(chain, blocks_path);
-    }
-
+    /* Note: blocks.dat is only saved on shutdown for better performance */
     return true;
 }
 
@@ -753,13 +739,6 @@ bool ftc_node_submit_block(ftc_node_t* node, ftc_block_t* block)
     /* Broadcast to peers */
     ftc_p2p_broadcast_block(node->p2p, block);
 
-    ftc_hash256_t hash;
-    ftc_block_hash(block, hash);
-    char hex[65];
-    ftc_hash_to_hex(hash, hex);
-
-    printf("[NODE] Block %d accepted: %s\n", node->chain->best_height, hex);
-
     return true;
 }
 
@@ -872,12 +851,9 @@ static const char* rpc_get_data_dir(void* ctx)
 static void p2p_on_peer_connected(ftc_p2p_t* p2p, ftc_peer_t* peer)
 {
     ftc_node_t* node = (ftc_node_t*)p2p->user_data;
-    printf("[NODE] Peer connected: %s (height=%d)\n", peer->ip_str, peer->start_height);
 
     /* Request blocks if peer has more than us */
     if (peer->start_height > (int)node->chain->best_height) {
-        printf("[NODE] Peer has more blocks (%d > %d), requesting headers\n",
-               peer->start_height, node->chain->best_height);
         ftc_hash256_t stop_hash = {0};
         ftc_peer_send_getheaders(peer, &node->chain->best_hash, 1, stop_hash);
     }
@@ -886,7 +862,7 @@ static void p2p_on_peer_connected(ftc_p2p_t* p2p, ftc_peer_t* peer)
 static void p2p_on_peer_disconnected(ftc_p2p_t* p2p, ftc_peer_t* peer)
 {
     (void)p2p;
-    printf("[NODE] Peer disconnected: %s\n", peer->ip_str);
+    (void)peer;
 }
 
 static void p2p_on_block(ftc_p2p_t* p2p, ftc_peer_t* peer, const ftc_block_t* block)
@@ -906,10 +882,6 @@ static void p2p_on_block(ftc_p2p_t* p2p, ftc_peer_t* peer, const ftc_block_t* bl
         /* Already have this block - skip silently */
         return;
     }
-
-    char hex[65];
-    ftc_hash_to_hex(hash, hex);
-    printf("[NODE] Received block: %s\n", hex);
 
     /* Clone block (const removal) */
     size_t size = ftc_block_serialize(block, NULL, 0);
@@ -997,11 +969,8 @@ static void p2p_on_headers(ftc_p2p_t* p2p, ftc_peer_t* peer, const ftc_block_hea
     ftc_node_t* node = (ftc_node_t*)p2p->user_data;
 
     if (count == 0) {
-        printf("[NODE] Received empty headers response\n");
         return;
     }
-
-    printf("[NODE] Received %zu headers from %s\n", count, peer->ip_str);
 
     /* Request blocks for headers we don't have */
     ftc_inv_t* inv = (ftc_inv_t*)malloc(count * sizeof(ftc_inv_t));
@@ -1021,7 +990,6 @@ static void p2p_on_headers(ftc_p2p_t* p2p, ftc_peer_t* peer, const ftc_block_hea
     }
 
     if (inv_count > 0) {
-        printf("[NODE] Requesting %zu blocks\n", inv_count);
         ftc_peer_send_getdata(peer, inv, inv_count);
     }
 
@@ -1072,7 +1040,6 @@ static void p2p_on_getheaders(ftc_p2p_t* p2p, ftc_peer_t* peer, const ftc_hash25
     }
 
     if (header_count > 0) {
-        printf("[NODE] Sending %zu headers to %s (from height %d)\n", header_count, peer->ip_str, start_height + 1);
         ftc_peer_send_headers(peer, headers, header_count);
     }
 
@@ -1187,10 +1154,6 @@ void ftc_node_free(ftc_node_t* node)
 
 bool ftc_node_start(ftc_node_t* node)
 {
-    printf("==============================================\n");
-    printf("  FTC Node v%s\n", FTC_NODE_VERSION);
-    printf("==============================================\n\n");
-
     node->start_time = time(NULL);
 
     /* Initialize chain */
@@ -1199,20 +1162,10 @@ bool ftc_node_start(ftc_node_t* node)
         return false;
     }
 
-    ftc_hash256_t genesis_hash;
-    ftc_block_hash(node->chain->genesis, genesis_hash);
-    char hex[65];
-    ftc_hash_to_hex(genesis_hash, hex);
-    printf("[NODE] Genesis block: %s\n", hex);
-
     /* Load blockchain from disk */
     char blocks_path[512];
     snprintf(blocks_path, sizeof(blocks_path), "%s/blocks.dat", node->config.data_dir);
-    int loaded = ftc_chain_load(node, blocks_path);
-    if (loaded > 0) {
-        printf("[NODE] Blockchain restored: %d blocks, height=%d\n",
-               node->chain->block_count, node->chain->best_height);
-    }
+    ftc_chain_load(node, blocks_path);
 
     /* Setup P2P callbacks */
     static ftc_p2p_callbacks_t p2p_callbacks = {
@@ -1240,6 +1193,9 @@ bool ftc_node_start(ftc_node_t* node)
         }
     }
 
+    /* Fast startup: connect to all seeds immediately for quick sync */
+    ftc_p2p_connect_all_seeds(node->p2p);
+
     /* Setup RPC handlers */
     static ftc_rpc_handlers_t rpc_handlers = {
         .get_block_by_hash = rpc_get_block_by_hash,
@@ -1264,15 +1220,7 @@ bool ftc_node_start(ftc_node_t* node)
         printf("[NODE] Failed to start RPC\n");
     }
 
-    if (node->wallet) {
-        char addr_str[64];
-        ftc_wallet_get_address_str(node->wallet, addr_str, sizeof(addr_str));
-        printf("[NODE] Wallet address: %s\n", addr_str);
-    }
-
     node->running = true;
-    printf("[NODE] Started successfully\n\n");
-
     return true;
 }
 
@@ -1280,13 +1228,12 @@ void ftc_node_stop(ftc_node_t* node)
 {
     if (!node->running) return;
 
-    printf("[NODE] Stopping...\n");
+    printf("Saving blockchain and stopping...\n");
 
     ftc_rpc_stop(node->rpc);
     ftc_p2p_stop(node->p2p);
 
     node->running = false;
-    printf("[NODE] Stopped\n");
 }
 
 void ftc_node_poll(ftc_node_t* node)
@@ -1301,6 +1248,77 @@ void ftc_node_poll(ftc_node_t* node)
     ftc_p2p_set_height(node->p2p, node->chain->best_height);
 }
 
+/*==============================================================================
+ * DASHBOARD
+ *============================================================================*/
+
+static void enable_virtual_terminal(void)
+{
+#ifdef _WIN32
+    HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+    DWORD dwMode = 0;
+    GetConsoleMode(hOut, &dwMode);
+    dwMode |= 0x0004;  /* ENABLE_VIRTUAL_TERMINAL_PROCESSING */
+    SetConsoleMode(hOut, dwMode);
+#endif
+}
+
+static void print_dashboard(ftc_node_t* node)
+{
+    int64_t now = time(NULL);
+    int64_t uptime = now - node->start_time;
+
+    /* Format uptime */
+    int days = (int)(uptime / 86400);
+    int hours = (int)((uptime % 86400) / 3600);
+    int mins = (int)((uptime % 3600) / 60);
+    int secs = (int)(uptime % 60);
+
+    /* Format best hash (last 16 chars) */
+    char hash_short[17];
+    char hash_hex[65];
+    ftc_hash_to_hex(node->chain->best_hash, hash_hex);
+    strncpy(hash_short, hash_hex + 48, 16);
+    hash_short[16] = '\0';
+
+    /* Calculate blocks/min */
+    float blocks_per_min = 0;
+    if (uptime > 0) {
+        blocks_per_min = (float)node->blocks_received * 60.0f / (float)uptime;
+    }
+
+    /* Time since last block */
+    int64_t since_block = node->last_block_time > 0 ? (now - node->last_block_time) : 0;
+
+    /* Move cursor to home and clear screen */
+    printf("\033[H\033[J");
+
+    /* Print dashboard */
+    printf("+--------------------------------------------------------------+\n");
+    printf("|            FTC Node v%-10s                              |\n", FTC_NODE_VERSION);
+    printf("+--------------------------------------------------------------+\n");
+    printf("|  Height:    %-10u          Peers:     %-3d              |\n",
+           node->chain->best_height, node->p2p->peer_count);
+    printf("|  Best:      ...%-16s   Outbound:  %-3d              |\n",
+           hash_short, node->p2p->outbound_count);
+    printf("|  Mempool:   %-10zu tx       Inbound:   %-3d              |\n",
+           ftc_mempool_count(node->mempool), node->p2p->inbound_count);
+    printf("+--------------------------------------------------------------+\n");
+    printf("|  Uptime:    %dd %02dh %02dm %02ds                                  |\n",
+           days, hours, mins, secs);
+    printf("|  Blocks:    %-6u received     (%.1f/min)                   |\n",
+           node->blocks_received, blocks_per_min);
+    printf("|  Last:      %-6lld sec ago                                   |\n",
+           (long long)since_block);
+    printf("+--------------------------------------------------------------+\n");
+    printf("|  P2P Port:  %-5u               RPC Port:  %-5u            |\n",
+           node->config.p2p_port, node->config.rpc_port);
+    printf("+--------------------------------------------------------------+\n");
+    printf("\n  Press Ctrl+C to stop\n");
+
+    fflush(stdout);
+}
+
 void ftc_node_run(ftc_node_t* node)
 {
     signal(SIGINT, signal_handler);
@@ -1308,15 +1326,38 @@ void ftc_node_run(ftc_node_t* node)
     signal(SIGTERM, signal_handler);
 #endif
 
+    /* Enable ANSI escape codes on Windows */
+    enable_virtual_terminal();
+
+    /* Initial dashboard */
+    node->prev_height = node->chain->best_height;
+    print_dashboard(node);
+
     while (node->running && !g_shutdown_requested) {
         ftc_node_poll(node);
 
+        /* Update dashboard every second */
+        int64_t now = time(NULL);
+        if (now - node->last_dashboard_update >= 1) {
+            /* Track blocks received */
+            if (node->chain->best_height > node->prev_height) {
+                node->blocks_received += (node->chain->best_height - node->prev_height);
+                node->last_block_time = now;
+                node->prev_height = node->chain->best_height;
+            }
+
+            print_dashboard(node);
+            node->last_dashboard_update = now;
+        }
+
 #ifdef _WIN32
-        Sleep(1);
+        Sleep(10);
 #else
-        usleep(1000);
+        usleep(10000);
 #endif
     }
 
+    /* Clear screen before shutdown message */
+    printf("\033[H\033[J");
     ftc_node_stop(node);
 }

@@ -219,6 +219,11 @@ void ftc_p2p_poll(ftc_p2p_t* p2p, int timeout_ms);
  */
 void ftc_p2p_set_height(ftc_p2p_t* p2p, uint32_t height);
 
+/**
+ * Connect to all seed nodes immediately (for fast startup sync)
+ */
+void ftc_p2p_connect_all_seeds(ftc_p2p_t* p2p);
+
 /*==============================================================================
  * MESSAGE SENDING
  *============================================================================*/

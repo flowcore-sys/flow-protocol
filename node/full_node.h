@@ -47,7 +47,7 @@ extern "C" {
  * CONSTANTS
  *============================================================================*/
 
-#define FTC_NODE_VERSION        "2.0.0"
+#define FTC_NODE_VERSION        "2.1.0"
 #define FTC_DATA_DIR            "ftcdata"
 #define FTC_BLOCKS_FILE         "blocks.dat"
 #define FTC_CHAIN_FILE          "chain.dat"
@@ -138,6 +138,12 @@ typedef struct {
     bool                running;
     bool                syncing;
     int64_t             start_time;
+
+    /* Dashboard stats */
+    int64_t             last_dashboard_update;
+    int64_t             last_block_time;
+    uint32_t            blocks_received;
+    uint32_t            prev_height;
 
 } ftc_node_t;
 

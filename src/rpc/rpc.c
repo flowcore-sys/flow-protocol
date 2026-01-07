@@ -396,7 +396,6 @@ bool ftc_rpc_start(ftc_rpc_server_t* rpc, uint16_t port)
     rpc->port = port;
     rpc->running = true;
 
-    printf("[RPC] Listening on port %d\n", port);
     return true;
 }
 
@@ -1497,10 +1496,7 @@ void ftc_rpc_poll(ftc_rpc_server_t* rpc, int timeout_ms)
         ftc_rpc_socket_t client = accept(rpc->listen_socket, (struct sockaddr*)&addr, &addr_len);
 
         if (client != FTC_RPC_INVALID_SOCKET) {
-            char* client_ip = inet_ntoa(addr.sin_addr);
-            printf("[RPC] Accepted connection from %s\n", client_ip);
             handle_client(rpc, client);
-            printf("[RPC] Finished handling %s\n", client_ip);
         } else {
 #ifdef _WIN32
             int err = WSAGetLastError();
