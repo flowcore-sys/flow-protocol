@@ -148,8 +148,8 @@ if(FTC_BUILD_CUDA)
     target_link_libraries(ftc-cuda CUDA::cudart)
     set_target_properties(ftc-cuda PROPERTIES CUDA_SEPARABLE_COMPILATION OFF)
 
-    # Set CUDA architectures (CUDA 13+ requires compute_75+)
-    set_target_properties(ftc-cuda PROPERTIES CUDA_ARCHITECTURES "89")
+    # Set CUDA architectures: 75=RTX20, 86=RTX30, 89=RTX40/50
+    set_target_properties(ftc-cuda PROPERTIES CUDA_ARCHITECTURES "75;86;89")
 
     # Platform-specific CUDA flags
     if(WIN32)
