@@ -38,15 +38,9 @@ extern "C" {
 #define FTC_TESTNET_PORT        27317
 #define FTC_TESTNET_RPC_PORT    27318
 
-#define FTC_P2P_PORT            17317
 #define FTC_RPC_PORT            17318
 
-#define FTC_MAX_PEERS           125
-#define FTC_MAX_OUTBOUND        8
-#define FTC_MAX_INBOUND         117
-
-#define FTC_MAX_MESSAGE_SIZE    (4 * 1024 * 1024)  /* 4MB */
-#define FTC_USER_AGENT          "/FTC:2.0.0/"
+#define FTC_USER_AGENT          "/FTC:2.1.0/"
 
 /*==============================================================================
  * SUPPLY & REWARDS
@@ -231,14 +225,6 @@ typedef struct {
     ftc_hash256_t   spent_txid;         /* Spending transaction */
     uint32_t        spent_vin;          /* Spending input index */
 } ftc_utxo_t;
-
-/*==============================================================================
- * PEER INFO (forward declaration - full type in network/p2p.h)
- *============================================================================*/
-
-/* ftc_peer_t is defined in src/network/p2p.h with full peer state */
-struct ftc_peer;
-typedef struct ftc_peer ftc_peer_t;
 
 /*==============================================================================
  * HELPER MACROS
