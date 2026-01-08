@@ -1,6 +1,7 @@
 /**
- * FTC Mining Pool Server v1.1.0
+ * FTC Mining Pool Server v1.2.0
  * Stratum Protocol + HTTP Stats API
+ * Fixed: block detection, hashrate calculation, difficulty formula
  */
 
 const net = require('net');
@@ -123,10 +124,30 @@ function targetToDiff(targetHex) {
     const reversedHex = reverseHex(targetHex);
     const target = BigInt('0x' + reversedHex);
     if (target === 0n) return Number.MAX_SAFE_INTEGER;
-    // FTC max target (diff 1) = 0x0fffff << 232 (from genesis bits 0x1e0fffff)
-    // In BE: 0x0fffff at bytes 29-31 = 0x0fffff * 2^232
-    const maxTarget = BigInt('0x0fffff') << 232n;
+    // FTC max target (diff 1) from genesis bits 0x1e0fffff:
+    // exponent = 0x1e = 30, coefficient = 0x0fffff
+    // target = coefficient * 256^(exp-3) = 0x0fffff * 2^(8*27) = 0x0fffff * 2^216
+    const maxTarget = BigInt('0x0fffff') << 216n;
     return Number(maxTarget / target);
+}
+
+// Get network target from nbits (for block detection)
+function nbitsToTarget(nbitsHex) {
+    // nbits is in LE hex, convert to number
+    const nbits = parseInt(reverseHex(nbitsHex), 16);
+    const exp = (nbits >> 24) & 0xff;
+    const coeff = nbits & 0x007fffff;
+    // target = coeff * 256^(exp-3)
+    const target = BigInt(coeff) << BigInt(8 * (exp - 3));
+    return target;
+}
+
+// Check if hash meets network target (for block detection)
+function hashMeetsTarget(hashHex, nbitsHex) {
+    // Hash is LE, reverse to BE for comparison
+    const hashBE = BigInt('0x' + reverseHex(hashHex));
+    const target = nbitsToTarget(nbitsHex);
+    return hashBE <= target;
 }
 
 function formatHashrate(h) {
@@ -471,13 +492,14 @@ class StratumClient {
                 w.lastShare = Date.now();
             }
 
-            // Estimate hashrate from share difficulty and time
-            this.updateHashrate(shareResult.diff);
+            // Estimate hashrate from pool difficulty and time between shares
+            this.updateHashrate();
 
             this.send({ id, result: true, error: null });
 
-            if (shareResult.diff >= g_networkDifficulty) {
-                log('INFO', `*** BLOCK FOUND by ${worker}! diff=${shareResult.diff.toFixed(0)} ***`);
+            // Check if hash meets network target (actual block found)
+            if (shareResult.hashHex && hashMeetsTarget(shareResult.hashHex, g_currentJob.nbits)) {
+                log('INFO', `*** BLOCK FOUND by ${worker}! hash=${shareResult.hashHex.substring(0, 16)}... ***`);
                 g_stats.blocksFound++;
                 g_stats.lastBlockTime = Date.now();
                 g_stats.lastBlockHeight = g_blockHeight;
@@ -494,13 +516,14 @@ class StratumClient {
         this.checkVardiff();
     }
 
-    updateHashrate(diff) {
-        // Hashrate = difficulty * 2^32 / time_between_shares
+    updateHashrate() {
+        // Hashrate = pool_difficulty * 2^32 / time_between_shares
+        // Use pool difficulty (this.difficulty) rather than share diff which has wrong scale for FTC
         const now = Date.now();
         if (this.lastShareTime) {
             const elapsed = (now - this.lastShareTime) / 1000;
             if (elapsed > 0 && elapsed < 300) {
-                this.hashrate = (diff * 4294967296) / elapsed;
+                this.hashrate = (this.difficulty * 4294967296) / elapsed;
             }
         }
     }
@@ -564,7 +587,7 @@ class StratumClient {
                 return { valid: false, code: 23, reason: 'Low difficulty', diff: hashDiff };
             }
 
-            return { valid: true, diff: hashDiff, nonce: nonceHex };
+            return { valid: true, diff: hashDiff, nonce: nonceHex, hashHex: hashHex };
         } catch (e) {
             log('ERROR', `verifyShare error: ${e.message}`);
             return { valid: false, code: 20, reason: 'Error', diff: 0 };
@@ -683,7 +706,7 @@ function startHttpServer() {
             const stats = {
                 pool: {
                     name: 'FTC Mining Pool',
-                    version: '1.1.0',
+                    version: '1.2.0',
                     fee: CONFIG.POOL_FEE * 100 + '%',
                     uptime: formatUptime(Date.now() - g_stats.startTime),
                     uptimeMs: Date.now() - g_stats.startTime,
@@ -871,7 +894,7 @@ function generateDashboardHtml() {
         </div>
 
         <div class="footer">
-            FTC Pool v1.1.0 | Stratum: pool.flowprotocol.net:3333 | Auto-refresh: 10s
+            FTC Pool v1.2.0 | Stratum: pool.flowprotocol.net:3333 | Auto-refresh: 10s
         </div>
     </div>
 </body>
@@ -884,7 +907,7 @@ function generateDashboardHtml() {
 
 async function startServer() {
     log('INFO', '═'.repeat(60));
-    log('INFO', 'FTC Mining Pool Server v1.1.0');
+    log('INFO', 'FTC Mining Pool Server v1.2.0');
     log('INFO', '═'.repeat(60));
     log('INFO', `Node: ${CONFIG.NODE_HOST}:${CONFIG.NODE_RPC_PORT}`);
     log('INFO', `Stratum port: ${CONFIG.POOL_PORT}`);
