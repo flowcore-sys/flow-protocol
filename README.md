@@ -188,72 +188,156 @@ ftc-miner-gpu -address 1YourAddressHere -devices 0,1
 
 ## RPC API
 
-FTC provides a JSON-RPC API for querying the blockchain.
+FTC provides a JSON-RPC API for querying the blockchain and sending transactions.
 
 ### Endpoint
 
 ```
-https://seed.flowprotocol.net:17318
+http://seed.flowprotocol.net:17318
 ```
 
-### Key Methods
+### RPC Methods
 
-| Method | Description |
-|--------|-------------|
-| `getinfo` | Get node status (blocks, version) |
-| `getblockcount` | Get current block height |
-| `getbestblockhash` | Get latest block hash |
-| `getdifficulty` | Get current mining difficulty |
-| `getbalance` | Get address balance |
-| `getblock` | Get block by hash or height |
-| `gettransaction` | Get transaction details |
-| `listunspent` | List UTXOs for address |
-| `sendrawtransaction` | Broadcast signed transaction |
+| Method | Params | Description |
+|--------|--------|-------------|
+| `getinfo` | - | Network status (blocks, difficulty, connections) |
+| `getblockcount` | - | Current block height |
+| `getdifficulty` | - | Current mining difficulty |
+| `getpeercount` | - | Number of active miners |
+| `getbalance` | [address] | Balance for address |
+| `listunspent` | [address] | UTXOs for address |
+| `getblock` | [height] | Block data by height |
+| `sendtoaddress` | [privkey, pubkey, to, amount, fee] | Send FTC |
 
-### Example: Check Balance
+---
+
+## Network Commands
+
+### Linux/macOS (curl)
 
 ```bash
-curl -X POST http://seed.flowprotocol.net:17318 \
-  -H "Content-Type: application/json" \
-  -d '{"jsonrpc":"2.0","method":"getbalance","params":["YOUR_ADDRESS"],"id":1}'
+# Node Status
+curl -s http://seed.flowprotocol.net:17318 -d '{"method":"getinfo"}'
+
+# Check Balance
+curl -s http://seed.flowprotocol.net:17318 -d '{"method":"getbalance","params":["YOUR_ADDRESS"]}'
+
+# Block Height
+curl -s http://seed.flowprotocol.net:17318 -d '{"method":"getblockcount"}'
+
+# Peer Count (active miners)
+curl -s http://seed.flowprotocol.net:17318 -d '{"method":"getpeercount"}'
+
+# Difficulty
+curl -s http://seed.flowprotocol.net:17318 -d '{"method":"getdifficulty"}'
+
+# List Unspent (UTXOs)
+curl -s http://seed.flowprotocol.net:17318 -d '{"method":"listunspent","params":["YOUR_ADDRESS"]}'
+
+# Get Block by Height
+curl -s http://seed.flowprotocol.net:17318 -d '{"method":"getblock","params":[100]}'
+
+# Send Transaction
+curl -s http://seed.flowprotocol.net:17318 -d '{
+  "method":"sendtoaddress",
+  "params":[
+    "YOUR_PRIVATE_KEY",
+    "YOUR_PUBLIC_KEY",
+    "RECIPIENT_ADDRESS",
+    10.0,
+    0.001
+  ]
+}'
 ```
 
-Response:
-```json
-{"jsonrpc":"2.0","result":1234.56789012,"id":"1"}
-```
+### Windows PowerShell
 
-### Example: Get Block Height
+```powershell
+# Node Status
+Invoke-RestMethod -Uri "http://seed.flowprotocol.net:17318" -Method POST -Body '{"method":"getinfo"}' -ContentType "application/json"
 
-```bash
-curl -X POST http://seed.flowprotocol.net:17318 \
-  -H "Content-Type: application/json" \
-  -d '{"jsonrpc":"2.0","method":"getblockcount","params":[],"id":1}'
+# Check Balance
+Invoke-RestMethod -Uri "http://seed.flowprotocol.net:17318" -Method POST -Body '{"method":"getbalance","params":["YOUR_ADDRESS"]}' -ContentType "application/json"
+
+# Block Height
+Invoke-RestMethod -Uri "http://seed.flowprotocol.net:17318" -Method POST -Body '{"method":"getblockcount"}' -ContentType "application/json"
+
+# Peer Count
+Invoke-RestMethod -Uri "http://seed.flowprotocol.net:17318" -Method POST -Body '{"method":"getpeercount"}' -ContentType "application/json"
+
+# Difficulty
+Invoke-RestMethod -Uri "http://seed.flowprotocol.net:17318" -Method POST -Body '{"method":"getdifficulty"}' -ContentType "application/json"
+
+# Send Transaction
+$tx = @{
+    method = "sendtoaddress"
+    params = @("YOUR_PRIVATE_KEY", "YOUR_PUBLIC_KEY", "RECIPIENT_ADDRESS", 10.0, 0.001)
+} | ConvertTo-Json
+Invoke-RestMethod -Uri "http://seed.flowprotocol.net:17318" -Method POST -Body $tx -ContentType "application/json"
 ```
 
 ---
 
 ## Wallet Commands
 
-### Generate New Address
+### Generate New Wallet
 
 ```bash
+# Linux/macOS
 ./ftc-genaddr
+
+# Windows
+ftc-genaddr.exe
 ```
 
 Output:
 ```
-Private Key: a1b2c3d4e5f6... (KEEP SECRET!)
-Address: 1FTC2ABC3DEF...
+Private key: d33890038793f57450381fec47694f840170e284adc032dbce20a523d29fae18
+Public key:  c630a43f14b335f57518649bf71fce9afd46488c183458437ea8e5b4e4e25a52
+Address:     123NqWqRKWbaajfoFkbeJ2GYiiwt6zqZZs
 ```
 
-### Check Balance via RPC
+> **IMPORTANT:** Save your Private Key securely! It cannot be recovered if lost.
+
+### Check Balance
 
 ```bash
-curl -s -X POST http://seed.flowprotocol.net:17318 \
-  -H "Content-Type: application/json" \
-  -d '{"jsonrpc":"2.0","method":"getbalance","params":["YOUR_ADDRESS"],"id":1}'
+curl -s http://seed.flowprotocol.net:17318 -d '{"method":"getbalance","params":["YOUR_ADDRESS"]}'
 ```
+
+Response:
+```json
+{"result":1234.56789012}
+```
+
+### Send FTC
+
+To send FTC, you need your Private Key, Public Key, recipient address, amount, and fee:
+
+```bash
+curl -s http://seed.flowprotocol.net:17318 -d '{
+  "method":"sendtoaddress",
+  "params":[
+    "YOUR_PRIVATE_KEY",
+    "YOUR_PUBLIC_KEY",
+    "RECIPIENT_ADDRESS",
+    10.0,
+    0.001
+  ]
+}'
+```
+
+Response:
+```json
+{"result":"transaction_id_here"}
+```
+
+**Parameters:**
+- `YOUR_PRIVATE_KEY` — 64 hex characters (from ftc-genaddr)
+- `YOUR_PUBLIC_KEY` — 64 hex characters (from ftc-genaddr)
+- `RECIPIENT_ADDRESS` — FTC address starting with "1"
+- `amount` — Amount to send (e.g., 10.0)
+- `fee` — Transaction fee (recommended: 0.001)
 
 ---
 
