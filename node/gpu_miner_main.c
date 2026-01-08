@@ -90,7 +90,7 @@ typedef int miner_socket_t;
  * CONSTANTS
  *============================================================================*/
 
-#define MINER_VERSION       "2.0.0"
+#define MINER_VERSION       "2.1.5"
 #define MINER_NAME          "FTC-GPU-Miner"
 #define MAX_NODES           16
 #define RPC_PORT            17318

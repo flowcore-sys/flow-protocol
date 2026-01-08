@@ -180,6 +180,7 @@ typedef struct ftc_gpu_ctx_wrapper {
     ftc_gpu_ctx_t*  backend_ctx;
     ftc_gpu_device_t device;
     uint32_t        batch_size;
+    uint32_t        pending_nonce;  /* For OpenCL async emulation */
 } ftc_gpu_ctx_wrapper_t;
 
 ftc_gpu_ctx_t* ftc_gpu_ctx_new(int device_id, uint32_t batch_size)
@@ -249,8 +250,10 @@ void ftc_gpu_launch(ftc_gpu_ctx_t* ctx, uint32_t nonce_start)
 
     if (wrapper->type == FTC_GPU_CUDA) {
         ftc_gpu_launch_cuda(wrapper->backend_ctx, nonce_start);
+    } else if (wrapper->type == FTC_GPU_OPENCL) {
+        /* OpenCL: store nonce for sync call (emulated async) */
+        wrapper->pending_nonce = nonce_start;
     }
-    /* OpenCL: TODO - for now use synchronous */
 }
 
 /* Synchronize and get results */
@@ -262,8 +265,10 @@ ftc_gpu_result_t ftc_gpu_sync(ftc_gpu_ctx_t* ctx)
 
     if (wrapper->type == FTC_GPU_CUDA) {
         return ftc_gpu_sync_cuda(wrapper->backend_ctx);
+    } else if (wrapper->type == FTC_GPU_OPENCL) {
+        /* OpenCL: run synchronous mining with stored nonce */
+        return ftc_gpu_mine_opencl(wrapper->backend_ctx, wrapper->pending_nonce);
     }
-    /* OpenCL: return empty result for now */
     return result;
 }
 
