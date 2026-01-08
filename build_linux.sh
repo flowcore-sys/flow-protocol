@@ -17,6 +17,8 @@ $CUDA_PATH/bin/nvcc -c "$SRC_DIR/src/miner/keccak256_cuda.cu" -o keccak256_cuda.
     -gencode=arch=compute_75,code=sm_75 \
     -gencode=arch=compute_86,code=sm_86 \
     -gencode=arch=compute_89,code=sm_89 \
+    -gencode=arch=compute_100,code=sm_100 \
+    -gencode=arch=compute_120,code=sm_120 \
     -O3 -DFTC_HAS_CUDA
 
 echo "Compiling C files..."
