@@ -93,7 +93,6 @@ set(FTC_MINER_SOURCES
 # GPU Miner sources (common)
 set(FTC_GPU_MINER_SOURCES
     src/miner/gpu_miner.c
-    src/miner/keccak256_opencl.c
 )
 
 # Core library

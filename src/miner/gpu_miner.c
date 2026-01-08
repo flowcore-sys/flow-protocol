@@ -52,20 +52,21 @@ static void ftc_gpu_update_stats_cuda(ftc_gpu_ctx_t* ctx) { (void)ctx; }
 #endif
 
 /*==============================================================================
- * EXTERNAL DECLARATIONS (OpenCL)
+ * EXTERNAL DECLARATIONS (OpenCL) - DISABLED
  *============================================================================*/
 
-extern int ftc_gpu_init_opencl(void);
-extern void ftc_gpu_shutdown_opencl(void);
-extern const ftc_gpu_device_t* ftc_gpu_get_opencl_device(int idx);
-extern int ftc_gpu_opencl_count(void);
-extern ftc_gpu_ctx_t* ftc_gpu_ctx_new_opencl(int device_id, uint32_t batch_size);
-extern void ftc_gpu_ctx_free_opencl(ftc_gpu_ctx_t* ctx);
-extern bool ftc_gpu_set_work_opencl(ftc_gpu_ctx_t* ctx, const uint8_t header[80], const uint8_t target[32]);
-extern ftc_gpu_result_t ftc_gpu_mine_opencl(ftc_gpu_ctx_t* ctx, uint32_t nonce_start);
-extern double ftc_gpu_get_hashrate_opencl(ftc_gpu_ctx_t* ctx);
-extern uint64_t ftc_gpu_get_total_hashes_opencl(ftc_gpu_ctx_t* ctx);
-extern void ftc_gpu_update_stats_opencl(ftc_gpu_ctx_t* ctx);
+/* OpenCL removed - CUDA only */
+static int ftc_gpu_init_opencl(void) { return 0; }
+static void ftc_gpu_shutdown_opencl(void) {}
+static const ftc_gpu_device_t* ftc_gpu_get_opencl_device(int idx) { (void)idx; return NULL; }
+static int ftc_gpu_opencl_count(void) { return 0; }
+static ftc_gpu_ctx_t* ftc_gpu_ctx_new_opencl(int device_id, uint32_t batch_size) { (void)device_id; (void)batch_size; return NULL; }
+static void ftc_gpu_ctx_free_opencl(ftc_gpu_ctx_t* ctx) { (void)ctx; }
+static bool ftc_gpu_set_work_opencl(ftc_gpu_ctx_t* ctx, const uint8_t header[80], const uint8_t target[32]) { (void)ctx; (void)header; (void)target; return false; }
+static ftc_gpu_result_t ftc_gpu_mine_opencl(ftc_gpu_ctx_t* ctx, uint32_t nonce_start) { (void)ctx; (void)nonce_start; ftc_gpu_result_t r = {0}; return r; }
+static double ftc_gpu_get_hashrate_opencl(ftc_gpu_ctx_t* ctx) { (void)ctx; return 0; }
+static uint64_t ftc_gpu_get_total_hashes_opencl(ftc_gpu_ctx_t* ctx) { (void)ctx; return 0; }
+static void ftc_gpu_update_stats_opencl(ftc_gpu_ctx_t* ctx) { (void)ctx; }
 
 /*==============================================================================
  * UNIFIED DEVICE LIST
