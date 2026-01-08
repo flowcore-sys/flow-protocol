@@ -131,11 +131,91 @@ static void bytes_to_hex(const uint8_t* data, size_t len, char* hex) {
  * CONSTANTS
  *============================================================================*/
 
-#define MINER_VERSION       "2.2.0"
+#define MINER_VERSION       "2.5.0"
+#define DEFAULT_POOL        "pool.flowprotocol.net:3333"
 #define MINER_NAME          "FTC-GPU-Miner"
 #define MAX_NODES           16
 #define RPC_PORT            17318
 #define LATENCY_CHECK_INTERVAL  30000
+#define STRATUM_PORT        3333
+
+/*==============================================================================
+ * STRATUM PROTOCOL (Pool Mining)
+ *============================================================================*/
+
+typedef enum {
+    MINING_MODE_SOLO,
+    MINING_MODE_POOL
+} mining_mode_t;
+
+typedef struct {
+    miner_socket_t sock;
+    char host[256];
+    uint16_t port;
+    char worker[128];       /* wallet address */
+    char password[64];      /* optional */
+    bool connected;
+    bool authorized;
+    bool subscribed;
+
+    /* Current job from pool */
+    char job_id[64];
+    uint8_t prevhash[32];
+    uint8_t coinb1[1024];
+    size_t coinb1_len;
+    uint8_t coinb2[1024];
+    size_t coinb2_len;
+    char extranonce1[32];
+    int extranonce2_size;
+    uint32_t version;
+    uint32_t ntime;
+    uint32_t nbits;
+    double target_diff;
+    bool has_job;
+
+    /* Extranonce2 counter */
+    uint64_t extranonce2;
+
+    /* Stats */
+    uint64_t shares_sent;
+    uint64_t shares_accepted;
+    uint64_t shares_rejected;
+    uint64_t shares_stale;
+    time_t connect_time;
+    time_t last_share_time;
+    int latency_ms;
+    uint64_t jobs_received;
+
+    /* Receive buffer */
+    char recv_buf[65536];
+    int recv_len;
+
+    /* Message ID counter */
+    int msg_id;
+} stratum_ctx_t;
+
+static stratum_ctx_t g_stratum = {0};
+static mining_mode_t g_mining_mode = MINING_MODE_POOL;  /* Pool by default */
+static char g_pool_url[256] = "pool.flowprotocol.net:3333";
+static char g_pool_pass[64] = "x";
+
+/*==============================================================================
+ * POOL STATS (from HTTP API)
+ *============================================================================*/
+
+typedef struct {
+    int miners_online;
+    double pool_hashrate;
+    char pool_hashrate_str[32];
+    uint64_t shares_accepted;
+    uint64_t shares_rejected;
+    int blocks_found;
+    int64_t last_update;
+    bool valid;
+} pool_stats_t;
+
+static pool_stats_t g_pool_stats = {0};
+#define POOL_STATS_INTERVAL 5000  /* Update every 5 seconds */
 
 static const char* DNS_SEEDS[] = {
     "seed.flowprotocol.net",
@@ -259,6 +339,117 @@ static void format_time(int64_t ms, char* buf, size_t len)
     if (h > 0) snprintf(buf, len, "%dh %02dm", h, m);
     else if (m > 0) snprintf(buf, len, "%dm %02ds", m, sec);
     else snprintf(buf, len, "%ds", sec);
+}
+
+/*==============================================================================
+ * POOL STATS HTTP CLIENT
+ *============================================================================*/
+
+/* Simple JSON value extractor (finds "key":value or "key":"value") */
+static int json_get_int(const char* json, const char* key)
+{
+    char pattern[64];
+    snprintf(pattern, sizeof(pattern), "\"%s\":", key);
+    const char* p = strstr(json, pattern);
+    if (!p) return 0;
+    p += strlen(pattern);
+    while (*p == ' ') p++;
+    return atoi(p);
+}
+
+static double json_get_double(const char* json, const char* key)
+{
+    char pattern[64];
+    snprintf(pattern, sizeof(pattern), "\"%s\":", key);
+    const char* p = strstr(json, pattern);
+    if (!p) return 0.0;
+    p += strlen(pattern);
+    while (*p == ' ') p++;
+    return atof(p);
+}
+
+static void json_get_string(const char* json, const char* key, char* out, size_t out_len)
+{
+    char pattern[64];
+    snprintf(pattern, sizeof(pattern), "\"%s\":\"", key);
+    const char* p = strstr(json, pattern);
+    if (!p) { out[0] = '\0'; return; }
+    p += strlen(pattern);
+    size_t i = 0;
+    while (*p && *p != '"' && i < out_len - 1) {
+        out[i++] = *p++;
+    }
+    out[i] = '\0';
+}
+
+/* Fetch pool stats from HTTP API (non-blocking) */
+static void fetch_pool_stats(void)
+{
+    int64_t now = get_time_ms();
+    if (now - g_pool_stats.last_update < POOL_STATS_INTERVAL) return;
+    g_pool_stats.last_update = now;
+
+    /* Connect to pool HTTP API on port 8080 */
+    miner_socket_t sock = create_tcp_socket();
+    if (sock == MINER_INVALID_SOCKET) return;
+
+    /* Set socket timeout */
+#ifdef _WIN32
+    DWORD timeout = 1000;
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout));
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, (const char*)&timeout, sizeof(timeout));
+#else
+    struct timeval tv = { .tv_sec = 1, .tv_usec = 0 };
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+#endif
+
+    /* Resolve pool host */
+    struct addrinfo hints = {0}, *result;
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+
+    if (getaddrinfo(g_stratum.host, "8080", &hints, &result) != 0) {
+        close_socket(sock);
+        return;
+    }
+
+    /* Connect */
+    if (connect(sock, result->ai_addr, (int)result->ai_addrlen) != 0) {
+        freeaddrinfo(result);
+        close_socket(sock);
+        return;
+    }
+    freeaddrinfo(result);
+
+    /* Send HTTP GET request */
+    const char* request = "GET /api/stats HTTP/1.0\r\nHost: pool\r\nConnection: close\r\n\r\n";
+    send(sock, request, (int)strlen(request), 0);
+
+    /* Receive response */
+    char response[4096] = {0};
+    int total = 0;
+    int n;
+    while ((n = recv(sock, response + total, sizeof(response) - total - 1, 0)) > 0) {
+        total += n;
+        if (total >= (int)sizeof(response) - 1) break;
+    }
+    response[total] = '\0';
+    close_socket(sock);
+
+    /* Find JSON body (after \r\n\r\n) */
+    const char* body = strstr(response, "\r\n\r\n");
+    if (!body) return;
+    body += 4;
+
+    /* Parse JSON */
+    g_pool_stats.miners_online = json_get_int(body, "online");
+    g_pool_stats.pool_hashrate = json_get_double(body, "hashrate");
+    json_get_string(body, "hashrateFormatted", g_pool_stats.pool_hashrate_str, sizeof(g_pool_stats.pool_hashrate_str));
+    g_pool_stats.shares_accepted = (uint64_t)json_get_int(body, "accepted");
+    g_pool_stats.shares_rejected = (uint64_t)json_get_int(body, "rejected");
+    g_pool_stats.blocks_found = json_get_int(body, "found");
+    g_pool_stats.valid = true;
 }
 
 /*==============================================================================
@@ -488,6 +679,422 @@ static int select_best_node(void)
     }
 
     return best;
+}
+
+/*==============================================================================
+ * STRATUM CLIENT FUNCTIONS
+ *============================================================================*/
+
+static void hex_to_bytes(const char* hex, uint8_t* out, size_t len)
+{
+    for (size_t i = 0; i < len; i++) {
+        unsigned int byte;
+        sscanf(hex + i * 2, "%02x", &byte);
+        out[i] = (uint8_t)byte;
+    }
+}
+
+static bool stratum_connect(stratum_ctx_t* ctx)
+{
+    ctx->sock = create_tcp_socket();
+    if (ctx->sock == MINER_INVALID_SOCKET) return false;
+
+    /* Set timeout */
+#ifdef _WIN32
+    DWORD timeout = 10000;
+    setsockopt(ctx->sock, SOL_SOCKET, SO_RCVTIMEO, (char*)&timeout, sizeof(timeout));
+    setsockopt(ctx->sock, SOL_SOCKET, SO_SNDTIMEO, (char*)&timeout, sizeof(timeout));
+#else
+    struct timeval tv = {10, 0};
+    setsockopt(ctx->sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(ctx->sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+#endif
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(ctx->port);
+
+    /* Resolve hostname */
+    struct addrinfo hints, *result;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+
+    if (getaddrinfo(ctx->host, NULL, &hints, &result) != 0) {
+        close_socket(ctx->sock);
+        ctx->sock = MINER_INVALID_SOCKET;
+        return false;
+    }
+
+    addr.sin_addr = ((struct sockaddr_in*)result->ai_addr)->sin_addr;
+    freeaddrinfo(result);
+
+    /* Measure connection latency */
+    int64_t t_start = get_time_ms();
+    if (connect(ctx->sock, (struct sockaddr*)&addr, sizeof(addr)) != 0) {
+        close_socket(ctx->sock);
+        ctx->sock = MINER_INVALID_SOCKET;
+        return false;
+    }
+    ctx->latency_ms = (int)(get_time_ms() - t_start);
+
+    ctx->connected = true;
+    ctx->recv_len = 0;
+    ctx->msg_id = 1;
+    ctx->connect_time = time(NULL);
+    ctx->jobs_received = 0;
+    return true;
+}
+
+static void stratum_disconnect(stratum_ctx_t* ctx)
+{
+    if (ctx->sock != MINER_INVALID_SOCKET) {
+        close_socket(ctx->sock);
+        ctx->sock = MINER_INVALID_SOCKET;
+        if (ctx->connected) {
+            log_to_buffer("Disconnected from pool");
+        }
+    }
+    ctx->connected = false;
+    ctx->authorized = false;
+    ctx->subscribed = false;
+    ctx->has_job = false;
+}
+
+static bool stratum_send(stratum_ctx_t* ctx, const char* msg)
+{
+    if (!ctx->connected) return false;
+
+    size_t len = strlen(msg);
+    char* buf = (char*)malloc(len + 2);
+    if (!buf) return false;
+
+    memcpy(buf, msg, len);
+    buf[len] = '\n';
+    buf[len + 1] = '\0';
+
+    int sent = send(ctx->sock, buf, (int)(len + 1), 0);
+    free(buf);
+
+    return sent == (int)(len + 1);
+}
+
+static bool stratum_recv_line(stratum_ctx_t* ctx, char* line, size_t line_size)
+{
+    /* Check if we have a complete line in buffer */
+    while (1) {
+        char* newline = (char*)memchr(ctx->recv_buf, '\n', ctx->recv_len);
+        if (newline) {
+            size_t line_len = newline - ctx->recv_buf;
+            if (line_len >= line_size) line_len = line_size - 1;
+            memcpy(line, ctx->recv_buf, line_len);
+            line[line_len] = '\0';
+
+            /* Remove line from buffer */
+            int remaining = ctx->recv_len - (int)(newline - ctx->recv_buf) - 1;
+            if (remaining > 0) {
+                memmove(ctx->recv_buf, newline + 1, remaining);
+            }
+            ctx->recv_len = remaining;
+            return true;
+        }
+
+        /* Need more data */
+        if (ctx->recv_len >= (int)sizeof(ctx->recv_buf) - 1) {
+            /* Buffer full, no newline - error */
+            return false;
+        }
+
+        int n = recv(ctx->sock, ctx->recv_buf + ctx->recv_len,
+                     (int)sizeof(ctx->recv_buf) - ctx->recv_len - 1, 0);
+        if (n <= 0) return false;
+        ctx->recv_len += n;
+    }
+}
+
+static bool stratum_subscribe(stratum_ctx_t* ctx)
+{
+    char msg[256];
+    snprintf(msg, sizeof(msg),
+        "{\"id\":%d,\"method\":\"mining.subscribe\",\"params\":[\"%s/%s\"]}",
+        ctx->msg_id++, MINER_NAME, MINER_VERSION);
+
+    if (!stratum_send(ctx, msg)) return false;
+
+    /* Read response */
+    char line[4096];
+    if (!stratum_recv_line(ctx, line, sizeof(line))) return false;
+
+    /* Parse response - look for extranonce1 and extranonce2_size */
+    char* result = strstr(line, "\"result\":");
+    if (!result) return false;
+
+    /* Find extranonce1 (first string in result array after subscription details) */
+    char* en1_start = strstr(result, "\",\"");
+    if (en1_start) {
+        en1_start += 3;
+        char* en1_end = strchr(en1_start, '"');
+        if (en1_end) {
+            size_t en1_len = en1_end - en1_start;
+            if (en1_len < sizeof(ctx->extranonce1)) {
+                memcpy(ctx->extranonce1, en1_start, en1_len);
+                ctx->extranonce1[en1_len] = '\0';
+            }
+        }
+    }
+
+    /* Find extranonce2_size (last number in result array) */
+    char* last_num = strrchr(result, ',');
+    if (last_num) {
+        ctx->extranonce2_size = atoi(last_num + 1);
+        if (ctx->extranonce2_size <= 0 || ctx->extranonce2_size > 8) {
+            ctx->extranonce2_size = 4;  /* Default */
+        }
+    }
+
+    ctx->subscribed = true;
+    return true;
+}
+
+static bool stratum_authorize(stratum_ctx_t* ctx)
+{
+    char msg[512];
+    snprintf(msg, sizeof(msg),
+        "{\"id\":%d,\"method\":\"mining.authorize\",\"params\":[\"%s\",\"%s\"]}",
+        ctx->msg_id++, ctx->worker, ctx->password);
+
+    if (!stratum_send(ctx, msg)) return false;
+
+    /* Read response */
+    char line[4096];
+    if (!stratum_recv_line(ctx, line, sizeof(line))) return false;
+
+    /* Check for success */
+    if (strstr(line, "\"result\":true")) {
+        ctx->authorized = true;
+        log_to_buffer("Connected to pool %s:%d", ctx->host, ctx->port);
+        return true;
+    }
+
+    return false;
+}
+
+static bool stratum_parse_notify(stratum_ctx_t* ctx, const char* line)
+{
+    /* Parse mining.notify message
+     * params: [job_id, prevhash, coinb1, coinb2, merkle_branches[], version, nbits, ntime, clean]
+     */
+    char* params = strstr(line, "\"params\":");
+    if (!params) return false;
+
+    params = strchr(params, '[');
+    if (!params) return false;
+    params++;
+
+    /* Extract job_id */
+    char* p = strchr(params, '"');
+    if (!p) return false;
+    p++;
+    char* end = strchr(p, '"');
+    if (!end) return false;
+    size_t len = end - p;
+    if (len >= sizeof(ctx->job_id)) len = sizeof(ctx->job_id) - 1;
+    memcpy(ctx->job_id, p, len);
+    ctx->job_id[len] = '\0';
+
+    /* Extract prevhash */
+    p = strchr(end + 1, '"');
+    if (!p) return false;
+    p++;
+    end = strchr(p, '"');
+    if (!end) return false;
+    len = end - p;
+    if (len >= 64) {
+        hex_to_bytes(p, ctx->prevhash, 32);
+    }
+
+    /* Extract coinb1 */
+    p = strchr(end + 1, '"');
+    if (!p) return false;
+    p++;
+    end = strchr(p, '"');
+    if (!end) return false;
+    len = end - p;
+    ctx->coinb1_len = len / 2;
+    if (ctx->coinb1_len > sizeof(ctx->coinb1)) ctx->coinb1_len = sizeof(ctx->coinb1);
+    hex_to_bytes(p, ctx->coinb1, ctx->coinb1_len);
+
+    /* Extract coinb2 */
+    p = strchr(end + 1, '"');
+    if (!p) return false;
+    p++;
+    end = strchr(p, '"');
+    if (!end) return false;
+    len = end - p;
+    ctx->coinb2_len = len / 2;
+    if (ctx->coinb2_len > sizeof(ctx->coinb2)) ctx->coinb2_len = sizeof(ctx->coinb2);
+    hex_to_bytes(p, ctx->coinb2, ctx->coinb2_len);
+
+    /* Skip merkle branches array */
+    p = strchr(end + 1, ']');
+    if (!p) return false;
+
+    /* Extract version (skip for now, FTC uses fixed) */
+
+    /* Find version, nbits and ntime - they're the hex values near the end */
+    char* comma = p;
+    int field_count = 0;
+    while (comma && field_count < 3) {
+        comma = strchr(comma + 1, '"');
+        if (comma) {
+            comma++;
+            char* field_end = strchr(comma, '"');
+            if (field_end) {
+                char field[32] = {0};
+                size_t flen = field_end - comma;
+                if (flen < sizeof(field)) {
+                    memcpy(field, comma, flen);
+                    if (field_count == 0) {
+                        /* version */
+                        ctx->version = (uint32_t)strtoul(field, NULL, 16);
+                    } else if (field_count == 1) {
+                        /* nbits */
+                        ctx->nbits = (uint32_t)strtoul(field, NULL, 16);
+                    } else if (field_count == 2) {
+                        /* ntime */
+                        ctx->ntime = (uint32_t)strtoul(field, NULL, 16);
+                    }
+                }
+                comma = field_end;
+            }
+            field_count++;
+        }
+    }
+
+    ctx->has_job = true;
+    ctx->jobs_received++;
+    log_to_buffer("New job #%llu", (unsigned long long)ctx->jobs_received);
+    return true;
+}
+
+static bool stratum_parse_difficulty(stratum_ctx_t* ctx, const char* line)
+{
+    char* params = strstr(line, "\"params\":");
+    if (!params) return false;
+
+    params = strchr(params, '[');
+    if (!params) return false;
+
+    double new_diff = atof(params + 1);
+    if (new_diff <= 0) new_diff = 1.0;
+    ctx->target_diff = new_diff;
+    return true;
+}
+
+static void stratum_handle_message(stratum_ctx_t* ctx, const char* line)
+{
+    if (strstr(line, "mining.notify")) {
+        stratum_parse_notify(ctx, line);
+    } else if (strstr(line, "mining.set_difficulty")) {
+        stratum_parse_difficulty(ctx, line);
+    } else if (strstr(line, "\"result\":true") && strstr(line, "\"id\":")) {
+        /* Share accepted */
+        ctx->shares_accepted++;
+        ctx->last_share_time = time(NULL);
+        log_to_buffer("ACCEPTED share #%llu (%.1f%% rate)",
+                  (unsigned long long)ctx->shares_accepted,
+                  ctx->shares_sent > 0 ? (100.0 * ctx->shares_accepted / ctx->shares_sent) : 0.0);
+    } else if (strstr(line, "\"result\":null") || strstr(line, "\"error\":")) {
+        /* Share rejected or error */
+        if (ctx->shares_sent > ctx->shares_accepted + ctx->shares_rejected + ctx->shares_stale) {
+            if (strstr(line, "stale") || strstr(line, "Stale") || strstr(line, "job not found")) {
+                ctx->shares_stale++;
+                log_to_buffer("STALE share #%llu", (unsigned long long)ctx->shares_stale);
+            } else {
+                ctx->shares_rejected++;
+                log_to_buffer("REJECTED share #%llu", (unsigned long long)ctx->shares_rejected);
+            }
+        }
+    }
+}
+
+static bool stratum_poll(stratum_ctx_t* ctx)
+{
+    if (!ctx->connected) return false;
+
+    /* Set non-blocking for poll */
+    set_socket_nonblocking(ctx->sock);
+
+    char line[4096];
+    bool got_message = false;
+
+    while (1) {
+        /* Try to get data without blocking */
+        int n = recv(ctx->sock, ctx->recv_buf + ctx->recv_len,
+                     (int)sizeof(ctx->recv_buf) - ctx->recv_len - 1, 0);
+
+        if (n > 0) {
+            ctx->recv_len += n;
+        } else if (n == 0) {
+            /* Connection closed */
+            stratum_disconnect(ctx);
+            return false;
+        }
+
+        /* Check for complete line */
+        char* newline = (char*)memchr(ctx->recv_buf, '\n', ctx->recv_len);
+        if (newline) {
+            size_t line_len = newline - ctx->recv_buf;
+            if (line_len >= sizeof(line)) line_len = sizeof(line) - 1;
+            memcpy(line, ctx->recv_buf, line_len);
+            line[line_len] = '\0';
+
+            /* Remove from buffer */
+            int remaining = ctx->recv_len - (int)(newline - ctx->recv_buf) - 1;
+            if (remaining > 0) {
+                memmove(ctx->recv_buf, newline + 1, remaining);
+            }
+            ctx->recv_len = remaining;
+
+            stratum_handle_message(ctx, line);
+            got_message = true;
+        } else {
+            break;
+        }
+    }
+
+    /* Restore blocking mode */
+#ifdef _WIN32
+    u_long mode = 0;
+    ioctlsocket(ctx->sock, FIONBIO, &mode);
+#else
+    int flags = fcntl(ctx->sock, F_GETFL, 0);
+    fcntl(ctx->sock, F_SETFL, flags & ~O_NONBLOCK);
+#endif
+
+    return got_message || ctx->has_job;
+}
+
+static bool stratum_submit_share(stratum_ctx_t* ctx, uint32_t nonce, uint32_t ntime)
+{
+    char extranonce2_hex[32];
+    for (int i = 0; i < ctx->extranonce2_size; i++) {
+        sprintf(extranonce2_hex + i * 2, "%02x",
+                (unsigned int)((ctx->extranonce2 >> (i * 8)) & 0xff));
+    }
+
+    char ntime_hex[16], nonce_hex[16];
+    sprintf(ntime_hex, "%08x", ntime);
+    sprintf(nonce_hex, "%08x", nonce);
+
+    char msg[512];
+    snprintf(msg, sizeof(msg),
+        "{\"id\":%d,\"method\":\"mining.submit\",\"params\":[\"%s\",\"%s\",\"%s\",\"%s\",\"%s\"]}",
+        ctx->msg_id++, ctx->worker, ctx->job_id, extranonce2_hex, ntime_hex, nonce_hex);
+
+    ctx->shares_sent++;
+    return stratum_send(ctx, msg);
 }
 
 /*==============================================================================
@@ -909,6 +1516,11 @@ static void draw_static_display(void)
 {
     int gpu_count = ftc_gpu_farm_device_count(g_farm);
 
+    /* Fetch pool stats periodically */
+    if (g_mining_mode == MINING_MODE_POOL && g_stratum.connected) {
+        fetch_pool_stats();
+    }
+
     /* Update GPU hashrates */
     for (int i = 0; i < gpu_count; i++) {
         g_gpu_hashrates[i] = ftc_gpu_farm_get_device_hashrate(g_farm, i);
@@ -926,12 +1538,34 @@ static void draw_static_display(void)
     printf(C_CLR_LINE C_CYAN C_BOLD "FTC GPU Miner v%s" C_RESET "  |  " C_WHITE "keccak256" C_RESET "\n", MINER_VERSION);
     printf(C_CLR_LINE "================================================================================\n");
 
-    /* Node info */
-    printf(C_CLR_LINE "Node: " C_CYAN "%s" C_RESET "  Latency: " C_GREEN "%dms" C_RESET "  Height: " C_YELLOW "%u" C_RESET "  Diff: %.4f\n",
-           g_nodes[g_active_node].ip,
-           g_nodes[g_active_node].latency_ms,
-           g_current_height,
-           g_difficulty);
+    /* Node/Pool info */
+    if (g_mining_mode == MINING_MODE_POOL) {
+        uint64_t total_shares = g_stratum.shares_accepted + g_stratum.shares_rejected + g_stratum.shares_stale;
+        double accept_rate = total_shares > 0 ? (100.0 * g_stratum.shares_accepted / total_shares) : 0.0;
+
+        printf(C_CLR_LINE "Pool: " C_MAGENTA "%s:%d" C_RESET "  Latency: " C_GREEN "%dms" C_RESET "  Diff: " C_YELLOW "%.1f" C_RESET "  Jobs: " C_CYAN "%llu" C_RESET "\n",
+               g_stratum.host, g_stratum.port, g_stratum.latency_ms, g_difficulty,
+               (unsigned long long)g_stratum.jobs_received);
+        printf(C_CLR_LINE "Shares: " C_GREEN "%llu" C_RESET "/" C_RED "%llu" C_RESET "/" C_YELLOW "%llu" C_RESET " (A/R/S)  Rate: " C_GREEN "%.1f%%" C_RESET "\n",
+               (unsigned long long)g_stratum.shares_accepted,
+               (unsigned long long)g_stratum.shares_rejected,
+               (unsigned long long)g_stratum.shares_stale,
+               accept_rate);
+
+        /* Pool stats from HTTP API */
+        if (g_pool_stats.valid) {
+            printf(C_CLR_LINE "Online: " C_CYAN "%d" C_RESET " miners  Pool HR: " C_GREEN "%s" C_RESET "  Blocks: " C_YELLOW "%d" C_RESET "\n",
+                   g_pool_stats.miners_online,
+                   g_pool_stats.pool_hashrate_str[0] ? g_pool_stats.pool_hashrate_str : "0 H/s",
+                   g_pool_stats.blocks_found);
+        }
+    } else {
+        printf(C_CLR_LINE "Node: " C_CYAN "%s" C_RESET "  Latency: " C_GREEN "%dms" C_RESET "  Height: " C_YELLOW "%u" C_RESET "  Diff: %.4f\n",
+               g_nodes[g_active_node].ip,
+               g_nodes[g_active_node].latency_ms,
+               g_current_height,
+               g_difficulty);
+    }
     printf(C_CLR_LINE "================================================================================\n");
 
     /* GPU table header */
@@ -962,8 +1596,38 @@ static void draw_static_display(void)
     printf(C_CLR_LINE "================================================================================\n");
 
     /* Status line */
-    printf(C_CLR_LINE "Uptime: " C_CYAN "%s" C_RESET "  Total hashes: " C_WHITE "%.2f B" C_RESET "\n",
-           uptime_str, (double)g_total_hashes / 1e9);
+    if (g_mining_mode == MINING_MODE_POOL) {
+        char conn_uptime[32];
+        char last_share_str[32];
+        time_t now = time(NULL);
+
+        if (g_stratum.connect_time > 0) {
+            format_uptime((now - g_stratum.connect_time) * 1000, conn_uptime, sizeof(conn_uptime));
+        } else {
+            snprintf(conn_uptime, sizeof(conn_uptime), "N/A");
+        }
+
+        if (g_stratum.last_share_time > 0) {
+            int secs = (int)(now - g_stratum.last_share_time);
+            if (secs < 60) {
+                snprintf(last_share_str, sizeof(last_share_str), "%ds ago", secs);
+            } else if (secs < 3600) {
+                snprintf(last_share_str, sizeof(last_share_str), "%dm %ds ago", secs / 60, secs % 60);
+            } else {
+                snprintf(last_share_str, sizeof(last_share_str), "%dh %dm ago", secs / 3600, (secs % 3600) / 60);
+            }
+        } else {
+            snprintf(last_share_str, sizeof(last_share_str), "None");
+        }
+
+        printf(C_CLR_LINE "Uptime: " C_CYAN "%s" C_RESET "  Connected: " C_GREEN "%s" C_RESET "  Last share: " C_YELLOW "%s" C_RESET "\n",
+               uptime_str, conn_uptime, last_share_str);
+        printf(C_CLR_LINE "Hashes: " C_WHITE "%.2f B" C_RESET "  Sent: " C_CYAN "%llu" C_RESET "\n",
+               (double)g_total_hashes / 1e9, (unsigned long long)g_stratum.shares_sent);
+    } else {
+        printf(C_CLR_LINE "Uptime: " C_CYAN "%s" C_RESET "  Total hashes: " C_WHITE "%.2f B" C_RESET "\n",
+               uptime_str, (double)g_total_hashes / 1e9);
+    }
 
     printf(C_CLR_LINE "================================================================================\n");
 
@@ -972,12 +1636,14 @@ static void draw_static_display(void)
     for (int i = 0; i < LOG_BUFFER_SIZE; i++) {
         int idx = (g_log_head - g_log_count + i + LOG_BUFFER_SIZE) % LOG_BUFFER_SIZE;
         if (i < g_log_count) {
-            if (strstr(g_log_buffer[idx], "BLOCK!")) {
+            if (strstr(g_log_buffer[idx], "BLOCK!") || strstr(g_log_buffer[idx], "ACCEPTED")) {
                 printf(C_CLR_LINE C_GREEN " %s" C_RESET "\n", g_log_buffer[idx]);
-            } else if (strstr(g_log_buffer[idx], "NETWORK")) {
+            } else if (strstr(g_log_buffer[idx], "NETWORK") || strstr(g_log_buffer[idx], "Connected")) {
                 printf(C_CLR_LINE C_CYAN " %s" C_RESET "\n", g_log_buffer[idx]);
             } else if (strstr(g_log_buffer[idx], "REJECTED")) {
                 printf(C_CLR_LINE C_RED " %s" C_RESET "\n", g_log_buffer[idx]);
+            } else if (strstr(g_log_buffer[idx], "STALE")) {
+                printf(C_CLR_LINE C_YELLOW " %s" C_RESET "\n", g_log_buffer[idx]);
             } else {
                 printf(C_CLR_LINE " %s\n", g_log_buffer[idx]);
             }
@@ -1152,16 +1818,21 @@ static void print_help(void)
     printf("Usage: ftc-miner-gpu -address <addr> [options]\n\n");
     printf("Options:\n");
     printf("  -address <addr>   Mining reward address (required)\n");
-    printf("  -node <host:port> Connect to specific node (default: DNS seeds)\n");
+    printf("  -pool <host:port> Pool server (default: %s)\n", DEFAULT_POOL);
+    printf("  -pool-pass <pass> Pool password (default: x)\n");
+    printf("  -solo             Solo mining mode (no pool)\n");
+    printf("  -node <host:port> Solo mode: connect to specific node\n");
     printf("  -devices <0,1,2>  GPU device IDs to use (default: all)\n");
     printf("  -intensity <n>    Mining intensity 1-100 (default: 100)\n");
     printf("  -no-color         Disable colored output\n");
     printf("  -list-devices     List available GPUs and exit\n");
     printf("  -help             Show this help\n\n");
-    printf("Example:\n");
-    printf("  ftc-miner-gpu -address 14CC2YgUzyMMhpPtXSwfYyHhus9kSYp6xo\n");
-    printf("  ftc-miner-gpu -address <addr> -node 127.0.0.1:17318\n");
-    printf("  ftc-miner-gpu -address <addr> -devices 0,1\n\n");
+    printf("Pool mining (default):\n");
+    printf("  ftc-miner-gpu -address YOUR_WALLET\n");
+    printf("  ftc-miner-gpu -address YOUR_WALLET -pool custom.pool.com:3333\n\n");
+    printf("Solo mining:\n");
+    printf("  ftc-miner-gpu -address YOUR_WALLET -solo\n");
+    printf("  ftc-miner-gpu -address YOUR_WALLET -solo -node 127.0.0.1:17318\n\n");
 }
 
 static void parse_devices(const char* str)
@@ -1196,6 +1867,16 @@ int main(int argc, char* argv[])
         }
         else if (strcmp(argv[i], "-node") == 0 && i + 1 < argc) {
             strncpy(g_custom_node, argv[++i], sizeof(g_custom_node) - 1);
+        }
+        else if (strcmp(argv[i], "-pool") == 0 && i + 1 < argc) {
+            strncpy(g_pool_url, argv[++i], sizeof(g_pool_url) - 1);
+            g_mining_mode = MINING_MODE_POOL;
+        }
+        else if (strcmp(argv[i], "-pool-pass") == 0 && i + 1 < argc) {
+            strncpy(g_pool_pass, argv[++i], sizeof(g_pool_pass) - 1);
+        }
+        else if (strcmp(argv[i], "-solo") == 0) {
+            g_mining_mode = MINING_MODE_SOLO;
         }
         else if (strcmp(argv[i], "-devices") == 0 && i + 1 < argc) {
             parse_devices(argv[++i]);
@@ -1264,163 +1945,377 @@ int main(int argc, char* argv[])
         return 1;
     }
 
-    /* Discover nodes and connect with retry */
-    printf("Connecting to FTC network...\n");
+    /*==========================================================================
+     * POOL MINING MODE
+     *========================================================================*/
+    if (g_mining_mode == MINING_MODE_POOL) {
+        /* Parse pool URL */
+        char pool_host[256] = {0};
+        uint16_t pool_port = STRATUM_PORT;
 
-    while (g_running) {
-        discover_nodes();
-
-        if (g_node_count == 0) {
-            printf("Searching for nodes... (retry in 3s)\n");
-            usleep(3000000);
-            continue;
+        strncpy(pool_host, g_pool_url, sizeof(pool_host) - 1);
+        char* colon = strchr(pool_host, ':');
+        if (colon) {
+            *colon = '\0';
+            pool_port = (uint16_t)atoi(colon + 1);
         }
 
-        update_node_latencies();
-        g_active_node = select_best_node();
+        strncpy(g_stratum.host, pool_host, sizeof(g_stratum.host) - 1);
+        g_stratum.port = pool_port;
+        strncpy(g_stratum.worker, g_miner_address, sizeof(g_stratum.worker) - 1);
+        strncpy(g_stratum.password, g_pool_pass, sizeof(g_stratum.password) - 1);
+        g_stratum.target_diff = 1.0;
 
-        if (g_active_node < 0) {
-            printf("Nodes unreachable, retrying in 3s...\n");
-            usleep(3000000);
-            continue;
-        }
+        printf("Connecting to pool %s:%d...\n", pool_host, pool_port);
 
-        if (get_node_info(g_active_node)) {
-            printf("Connected to %s (latency: %dms)\n",
-                   g_nodes[g_active_node].ip,
-                   g_nodes[g_active_node].latency_ms);
-            break;  /* Successfully connected */
-        }
-
-        printf("Connection failed, retrying in 3s...\n");
-        usleep(3000000);
-    }
-
-    if (!g_running) {
-        ftc_gpu_farm_free(g_farm);
-        ftc_gpu_shutdown();
-        return 0;
-    }
-
-    /* Start mining - clear screen immediately for static display */
-    g_start_time = get_time_ms();
-    int64_t last_stats = g_start_time;
-    int64_t last_latency_check = g_start_time;
-
-    printf(C_CLEAR C_HOME C_HIDE_CUR);
-    fflush(stdout);
-
-    /* Draw initial display before first block template */
-    draw_static_display();
-
-    while (g_running) {
-        uint32_t height = 0;
-        ftc_block_t* block = get_block_template(g_active_node, &height);
-
-        if (!block) {
-            g_nodes[g_active_node].failures++;
-            if (g_nodes[g_active_node].failures > 5) {
-                g_nodes[g_active_node].connected = false;
-                char ts[16];
-                get_timestamp(ts, sizeof(ts));
-                log_to_buffer("[%s] Node %s offline, searching...", ts, g_nodes[g_active_node].ip);
-                draw_static_display();
-                g_active_node = select_best_node();
-                if (g_active_node < 0) {
-                    log_to_buffer("[%s] All nodes offline. Retrying in 5s...", ts);
-                    draw_static_display();
-                    usleep(5000000);
-                    update_node_latencies();
-                    g_active_node = select_best_node();
-                    continue;
-                }
-                log_to_buffer("[%s] Switched to %s", ts, g_nodes[g_active_node].ip);
-                draw_static_display();
-            }
-            usleep(2000000);
-            continue;
-        }
-
-        g_current_height = height;
-
-        /* Update node info (difficulty, etc) on each new block */
-        get_node_info(g_active_node);
-
-        /* Prepare work */
-        uint8_t header[80];
-        ftc_block_header_serialize(&block->header, header);
-
-        ftc_hash256_t target;
-        ftc_bits_to_target(block->header.bits, target);
-
-        ftc_gpu_farm_set_work(g_farm, header, target);
-
-        /* Mine until block found or new block from network */
-        int64_t last_block_check = get_time_ms();
+        /* Connect to pool with retry */
         while (g_running) {
-            int64_t now;
-            ftc_gpu_result_t result = ftc_gpu_farm_mine(g_farm);
-            g_total_hashes += result.hashes;
+            if (stratum_connect(&g_stratum)) {
+                printf("Connected to pool, subscribing...\n");
 
-            now = get_time_ms();
+                if (stratum_subscribe(&g_stratum)) {
+                    printf("Subscribed (extranonce1=%s, en2_size=%d)\n",
+                           g_stratum.extranonce1, g_stratum.extranonce2_size);
 
-            if (result.found) {
-                block->header.nonce = result.nonce;
-                g_blocks_found++;
-
-                char hash_str[17];
-                for (int i = 0; i < 8; i++) sprintf(hash_str + i * 2, "%02x", result.hash[i]);
-                strncpy(g_last_block_hash, hash_str, 16);
-
-                bool accepted = submit_block(g_active_node, block);
-                if (accepted) {
-                    g_blocks_accepted++;
-                    g_current_height = height + 1;
+                    if (stratum_authorize(&g_stratum)) {
+                        printf("Authorized as %s\n", g_stratum.worker);
+                        break;
+                    } else {
+                        fprintf(stderr, "Authorization failed\n");
+                    }
+                } else {
+                    fprintf(stderr, "Subscription failed\n");
                 }
-
-                log_share_found(height, g_last_block_hash, accepted);
-
-                /* Update display after block found */
-                draw_static_display();
-                last_stats = now;
-                break;
+                stratum_disconnect(&g_stratum);
             }
 
-            /* Update display every 200ms for responsive UI */
-            if (now - last_stats >= 200) {
-                draw_static_display();
-                last_stats = now;
-            }
+            printf("Connection failed, retrying in 5s...\n");
+            usleep(5000000);
+        }
 
-            /* Check for new block from network every 5 seconds */
-            if (now - last_block_check >= 5000) {
-                if (get_node_info(g_active_node) && g_nodes[g_active_node].height > height) {
-                    /* Log network block */
-                    char ts[16];
-                    get_timestamp(ts, sizeof(ts));
-                    log_to_buffer("[%s] NETWORK h=%u (new block from other miner)", ts, g_nodes[g_active_node].height);
-                    g_current_height = g_nodes[g_active_node].height;
-                    draw_static_display();
-                    break;
+        if (!g_running) {
+            stratum_disconnect(&g_stratum);
+            ftc_gpu_farm_free(g_farm);
+            ftc_gpu_shutdown();
+            return 0;
+        }
+
+        /* Pool mining main loop */
+        g_start_time = get_time_ms();
+        int64_t last_stats = g_start_time;
+        int64_t last_pool_poll = g_start_time;
+
+        printf(C_CLEAR C_HOME C_HIDE_CUR);
+        fflush(stdout);
+
+        /* Wait for first job */
+        printf("Waiting for work from pool...\n");
+        while (g_running && !g_stratum.has_job) {
+            stratum_poll(&g_stratum);
+            usleep(100000);
+        }
+
+        while (g_running) {
+            if (!g_stratum.connected) {
+                /* Reconnect */
+                log_to_buffer("Pool disconnected, reconnecting...");
+                while (g_running && !g_stratum.connected) {
+                    if (stratum_connect(&g_stratum) &&
+                        stratum_subscribe(&g_stratum) &&
+                        stratum_authorize(&g_stratum)) {
+                        log_to_buffer("Reconnected to pool");
+                        break;
+                    }
+                    usleep(5000000);
                 }
-                last_block_check = now;
+                continue;
             }
 
-            /* Check latency every 30 seconds */
-            if (now - last_latency_check >= LATENCY_CHECK_INTERVAL) {
-                update_node_latencies();
-                int best = select_best_node();
-                if (best >= 0 && best != g_active_node) {
-                    if (g_nodes[best].latency_ms + 100 < g_nodes[g_active_node].latency_ms) {
-                        g_active_node = best;
+            if (!g_stratum.has_job) {
+                stratum_poll(&g_stratum);
+                usleep(100000);
+                continue;
+            }
+
+            /* Build work from stratum job */
+            /* Calculate network difficulty from nbits (FTC formula)
+             * FTC diff 1 target is 4096x larger than Bitcoin's */
+            {
+                uint32_t nbits = g_stratum.nbits;
+                uint32_t exp = (nbits >> 24) & 0xff;
+                uint32_t mant = nbits & 0x00ffffff;
+                /* Bitcoin formula then multiply by 4096 for FTC */
+                double target_d = (double)mant * pow(256.0, (double)(exp - 3));
+                double max_target = (double)0x00ffff * pow(256.0, (double)(0x1d - 3));
+                double btc_diff = max_target / target_d;
+                g_difficulty = btc_diff * 4096.0;  /* FTC multiplier */
+            }
+
+            /* For FTC, we build header from pool data */
+            uint8_t header[80];
+            memset(header, 0, 80);
+
+            /* Version (4 bytes) - use version from pool job */
+            memcpy(header, &g_stratum.version, 4);
+
+            /* Previous block hash (32 bytes) */
+            memcpy(header + 4, g_stratum.prevhash, 32);
+
+            /* Merkle root (32 bytes) - pool sends it in coinb1 field */
+            memcpy(header + 36, g_stratum.coinb1, 32);
+
+            /* Time (4 bytes) */
+            memcpy(header + 68, &g_stratum.ntime, 4);
+
+            /* Bits (4 bytes) */
+            memcpy(header + 72, &g_stratum.nbits, 4);
+
+            /* Nonce (4 bytes) - will be filled by miner */
+            /* header[76-79] = 0 */
+
+            /* Use POOL difficulty for share finding
+             * FTC diff 1 nbits = 0x1e0fffff (genesis)
+             * Pool diff is typically 1, network diff is ~65536 */
+            ftc_hash256_t target;
+
+            /* Calculate nbits for pool difficulty
+             * FTC genesis (diff 1) = 0x1e0fffff
+             * For higher diff, we reduce the target proportionally */
+            double pool_diff = g_stratum.target_diff;
+            if (pool_diff < 1.0) pool_diff = 1.0;
+
+            /* For diff 1, use genesis bits; for higher diff, use network bits */
+            uint32_t pool_nbits;
+            if (pool_diff <= 1.0) {
+                pool_nbits = 0x1e0fffff;  /* FTC genesis = diff 1 */
+            } else {
+                /* Scale down from network difficulty */
+                pool_nbits = g_stratum.nbits;
+            }
+
+            ftc_bits_to_target(pool_nbits, target);
+            ftc_gpu_farm_set_work(g_farm, header, target);
+
+            char current_job[64];
+            strncpy(current_job, g_stratum.job_id, sizeof(current_job) - 1);
+
+            /* Mine until share found or new job */
+            while (g_running && g_stratum.connected) {
+                int64_t now;
+                ftc_gpu_result_t result = ftc_gpu_farm_mine(g_farm);
+                g_total_hashes += result.hashes;
+
+                now = get_time_ms();
+
+                /* Poll for new jobs */
+                if (now - last_pool_poll >= 100) {
+                    stratum_poll(&g_stratum);
+                    last_pool_poll = now;
+
+                    /* Check if job changed */
+                    if (strcmp(current_job, g_stratum.job_id) != 0) {
+                        char ts[16];
+                        get_timestamp(ts, sizeof(ts));
+                        log_to_buffer("[%s] New job: %s", ts, g_stratum.job_id);
+                        g_stratum.extranonce2++;
+                        break;  /* Get new work */
                     }
                 }
-                last_latency_check = now;
+
+                if (result.found) {
+                    g_blocks_found++;
+
+                    char hash_str[17];
+                    for (int i = 0; i < 8; i++) sprintf(hash_str + i * 2, "%02x", result.hash[i]);
+                    strncpy(g_last_block_hash, hash_str, 16);
+
+                    /* Submit share to pool */
+                    stratum_submit_share(&g_stratum, result.nonce, g_stratum.ntime);
+
+                    char ts[16];
+                    get_timestamp(ts, sizeof(ts));
+                    log_to_buffer("[%s] Share submitted: %s", ts, hash_str);
+
+                    g_blocks_accepted = g_stratum.shares_accepted;
+
+                    /* Increment extranonce2 for next share */
+                    g_stratum.extranonce2++;
+                }
+
+                /* Update display */
+                if (now - last_stats >= 200) {
+                    /* Update stats from stratum */
+                    g_blocks_accepted = g_stratum.shares_accepted;
+                    draw_static_display();
+                    last_stats = now;
+                }
             }
         }
 
-        ftc_block_free(block);
-        /* No delay - immediately get next block template */
+        stratum_disconnect(&g_stratum);
+    }
+    /*==========================================================================
+     * SOLO MINING MODE
+     *========================================================================*/
+    else {
+        /* Discover nodes and connect with retry */
+        printf("Connecting to FTC network...\n");
+
+        while (g_running) {
+            discover_nodes();
+
+            if (g_node_count == 0) {
+                printf("Searching for nodes... (retry in 3s)\n");
+                usleep(3000000);
+                continue;
+            }
+
+            update_node_latencies();
+            g_active_node = select_best_node();
+
+            if (g_active_node < 0) {
+                printf("Nodes unreachable, retrying in 3s...\n");
+                usleep(3000000);
+                continue;
+            }
+
+            if (get_node_info(g_active_node)) {
+                printf("Connected to %s (latency: %dms)\n",
+                       g_nodes[g_active_node].ip,
+                       g_nodes[g_active_node].latency_ms);
+                break;  /* Successfully connected */
+            }
+
+            printf("Connection failed, retrying in 3s...\n");
+            usleep(3000000);
+        }
+
+        if (!g_running) {
+            ftc_gpu_farm_free(g_farm);
+            ftc_gpu_shutdown();
+            return 0;
+        }
+
+        /* Start mining - clear screen immediately for static display */
+        g_start_time = get_time_ms();
+        int64_t last_stats = g_start_time;
+        int64_t last_latency_check = g_start_time;
+
+        printf(C_CLEAR C_HOME C_HIDE_CUR);
+        fflush(stdout);
+
+        /* Draw initial display before first block template */
+        draw_static_display();
+
+        while (g_running) {
+            uint32_t height = 0;
+            ftc_block_t* block = get_block_template(g_active_node, &height);
+
+            if (!block) {
+                g_nodes[g_active_node].failures++;
+                if (g_nodes[g_active_node].failures > 5) {
+                    g_nodes[g_active_node].connected = false;
+                    char ts[16];
+                    get_timestamp(ts, sizeof(ts));
+                    log_to_buffer("[%s] Node %s offline, searching...", ts, g_nodes[g_active_node].ip);
+                    draw_static_display();
+                    g_active_node = select_best_node();
+                    if (g_active_node < 0) {
+                        log_to_buffer("[%s] All nodes offline. Retrying in 5s...", ts);
+                        draw_static_display();
+                        usleep(5000000);
+                        update_node_latencies();
+                        g_active_node = select_best_node();
+                        continue;
+                    }
+                    log_to_buffer("[%s] Switched to %s", ts, g_nodes[g_active_node].ip);
+                    draw_static_display();
+                }
+                usleep(2000000);
+                continue;
+            }
+
+            g_current_height = height;
+
+            /* Update node info (difficulty, etc) on each new block */
+            get_node_info(g_active_node);
+
+            /* Prepare work */
+            uint8_t header[80];
+            ftc_block_header_serialize(&block->header, header);
+
+            ftc_hash256_t target;
+            ftc_bits_to_target(block->header.bits, target);
+
+            ftc_gpu_farm_set_work(g_farm, header, target);
+
+            /* Mine until block found or new block from network */
+            int64_t last_block_check = get_time_ms();
+            while (g_running) {
+                int64_t now;
+                ftc_gpu_result_t result = ftc_gpu_farm_mine(g_farm);
+                g_total_hashes += result.hashes;
+
+                now = get_time_ms();
+
+                if (result.found) {
+                    block->header.nonce = result.nonce;
+                    g_blocks_found++;
+
+                    char hash_str[17];
+                    for (int i = 0; i < 8; i++) sprintf(hash_str + i * 2, "%02x", result.hash[i]);
+                    strncpy(g_last_block_hash, hash_str, 16);
+
+                    bool accepted = submit_block(g_active_node, block);
+                    if (accepted) {
+                        g_blocks_accepted++;
+                        g_current_height = height + 1;
+                    }
+
+                    log_share_found(height, g_last_block_hash, accepted);
+
+                    /* Update display after block found */
+                    draw_static_display();
+                    last_stats = now;
+                    break;
+                }
+
+                /* Update display every 200ms for responsive UI */
+                if (now - last_stats >= 200) {
+                    draw_static_display();
+                    last_stats = now;
+                }
+
+                /* Check for new block from network every 5 seconds */
+                if (now - last_block_check >= 5000) {
+                    if (get_node_info(g_active_node) && g_nodes[g_active_node].height > height) {
+                        /* Log network block */
+                        char ts[16];
+                        get_timestamp(ts, sizeof(ts));
+                        log_to_buffer("[%s] NETWORK h=%u (new block from other miner)", ts, g_nodes[g_active_node].height);
+                        g_current_height = g_nodes[g_active_node].height;
+                        draw_static_display();
+                        break;
+                    }
+                    last_block_check = now;
+                }
+
+                /* Check latency every 30 seconds */
+                if (now - last_latency_check >= LATENCY_CHECK_INTERVAL) {
+                    update_node_latencies();
+                    int best = select_best_node();
+                    if (best >= 0 && best != g_active_node) {
+                        if (g_nodes[best].latency_ms + 100 < g_nodes[g_active_node].latency_ms) {
+                            g_active_node = best;
+                        }
+                    }
+                    last_latency_check = now;
+                }
+            }
+
+            ftc_block_free(block);
+            /* No delay - immediately get next block template */
+        }
     }
 
     print_final_stats();
