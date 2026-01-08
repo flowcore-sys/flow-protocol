@@ -1119,9 +1119,8 @@ static void log_share_found(uint32_t height, const char* hash, bool accepted)
 
     if (accepted) {
         log_to_buffer("[%s] BLOCK! h=%u %s", ts, height, hash);
-    } else {
-        log_to_buffer("[%s] REJECTED h=%u", ts, height);
     }
+    /* Don't show rejected blocks - only accepted ones matter */
 }
 
 static void print_final_stats(void)
