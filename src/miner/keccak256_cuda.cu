@@ -192,7 +192,10 @@ __device__ __forceinline__ void keccak256_32(const uint8_t* data, uint8_t* hash)
 
 /*==============================================================================
  * DOUBLE KECCAK-256 MINING KERNEL
+ * Each thread processes multiple nonces for better GPU utilization
  *============================================================================*/
+
+#define HASHES_PER_THREAD 8
 
 __global__ void keccak256_mine_kernel(
     const uint64_t* __restrict__ header64,  /* 80-byte header as 10 uint64_t (nonce at bytes 76-79) */
@@ -203,43 +206,54 @@ __global__ void keccak256_mine_kernel(
     uint32_t* found
 )
 {
-    uint32_t nonce = nonce_start + blockIdx.x * blockDim.x + threadIdx.x;
+    uint32_t thread_id = blockIdx.x * blockDim.x + threadIdx.x;
+    uint32_t base_nonce = nonce_start + thread_id * HASHES_PER_THREAD;
 
-    /* Load header using 64-bit operations (10x faster than byte copy) */
-    uint64_t local_header_u64[10];
+    /* Load header base (first 9 words are constant) */
+    uint64_t header_base[9];
     #pragma unroll
     for (int i = 0; i < 9; i++) {
-        local_header_u64[i] = header64[i];
+        header_base[i] = header64[i];
     }
-
-    /* Set nonce in last 64-bit word (bytes 72-79, nonce is at 76-79) */
-    /* header64[9] contains bytes 72-79, we need to replace bytes 76-79 with nonce */
-    uint64_t last_word = header64[9];
-    last_word = (last_word & 0x00000000FFFFFFFFULL) | ((uint64_t)nonce << 32);
-    local_header_u64[9] = last_word;
-
-    /* Double Keccak-256 */
-    uint64_t hash1_u64[4], hash2_u64[4];
-    keccak256_80((uint8_t*)local_header_u64, (uint8_t*)hash1_u64);
-    keccak256_32((uint8_t*)hash1_u64, (uint8_t*)hash2_u64);
-
-    /* Compare with target (big-endian comparison from MSB) */
-    uint8_t* hash2 = (uint8_t*)hash2_u64;
+    uint64_t last_word_base = header64[9] & 0x00000000FFFFFFFFULL;
     const uint8_t* target = (const uint8_t*)target64;
-    bool valid = true;
-    #pragma unroll
-    for (int i = 31; i >= 0; i--) {
-        if (hash2[i] < target[i]) break;
-        if (hash2[i] > target[i]) { valid = false; break; }
-    }
 
-    if (valid) {
-        if (atomicCAS(found, 0, 1) == 0) {
-            *result_nonce = nonce;
-            #pragma unroll
-            for (int i = 0; i < 32; i++) {
-                result_hash[i] = hash2[i];
+    /* Process multiple nonces per thread */
+    #pragma unroll
+    for (int n = 0; n < HASHES_PER_THREAD; n++) {
+        uint32_t nonce = base_nonce + n;
+
+        /* Build header with current nonce */
+        uint64_t local_header_u64[10];
+        #pragma unroll
+        for (int i = 0; i < 9; i++) {
+            local_header_u64[i] = header_base[i];
+        }
+        local_header_u64[9] = last_word_base | ((uint64_t)nonce << 32);
+
+        /* Double Keccak-256 */
+        uint64_t hash1_u64[4], hash2_u64[4];
+        keccak256_80((uint8_t*)local_header_u64, (uint8_t*)hash1_u64);
+        keccak256_32((uint8_t*)hash1_u64, (uint8_t*)hash2_u64);
+
+        /* Compare with target (big-endian comparison from MSB) */
+        uint8_t* hash2 = (uint8_t*)hash2_u64;
+        bool valid = true;
+        #pragma unroll
+        for (int i = 31; i >= 0; i--) {
+            if (hash2[i] < target[i]) break;
+            if (hash2[i] > target[i]) { valid = false; break; }
+        }
+
+        if (valid) {
+            if (atomicCAS(found, 0, 1) == 0) {
+                *result_nonce = nonce;
+                #pragma unroll
+                for (int i = 0; i < 32; i++) {
+                    result_hash[i] = hash2[i];
+                }
             }
+            return;
         }
     }
 }
@@ -449,9 +463,10 @@ extern "C" void ftc_gpu_launch_cuda(ftc_gpu_ctx_t* ctx, uint32_t nonce_start)
     uint32_t zero = 0;
     cudaMemcpyAsync(ctx->d_found, &zero, sizeof(uint32_t), cudaMemcpyHostToDevice, ctx->stream);
 
-    /* Calculate grid dimensions - 256 threads (keccak uses many registers) */
+    /* Calculate grid dimensions - 256 threads, each processes HASHES_PER_THREAD nonces */
     int threads_per_block = 256;
-    int blocks = (ctx->batch_size + threads_per_block - 1) / threads_per_block;
+    int total_threads = (ctx->batch_size + HASHES_PER_THREAD - 1) / HASHES_PER_THREAD;
+    int blocks = (total_threads + threads_per_block - 1) / threads_per_block;
 
     /* Start timing */
     cudaEventRecord(ctx->start_event, ctx->stream);
