@@ -496,11 +496,11 @@ static char* rpc_call(int node_idx, const char* method, const char* params)
     if (sock == MINER_INVALID_SOCKET) return NULL;
 
 #ifdef _WIN32
-    DWORD timeout = 1000;  /* 1 second timeout for faster mining */
+    DWORD timeout = 3000;  /* 3 second timeout - more tolerant */
     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (char*)&timeout, sizeof(timeout));
     setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, (char*)&timeout, sizeof(timeout));
 #else
-    struct timeval tv = {1, 0};  /* 1 second timeout */
+    struct timeval tv = {3, 0};  /* 3 second timeout */
     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 #endif
@@ -1240,7 +1240,7 @@ int main(int argc, char* argv[])
 
         if (!block) {
             g_nodes[g_active_node].failures++;
-            if (g_nodes[g_active_node].failures > 3) {
+            if (g_nodes[g_active_node].failures > 5) {
                 g_nodes[g_active_node].connected = false;
                 char ts[16];
                 get_timestamp(ts, sizeof(ts));
