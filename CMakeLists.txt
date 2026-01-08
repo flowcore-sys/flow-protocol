@@ -56,10 +56,10 @@ set(FTC_CORE_SOURCES
     src/core/mempool.c
 )
 
-# Network sources
+# Network sources (P2P removed - centralized architecture)
 set(FTC_NETWORK_SOURCES
-    src/network/protocol.c
-    src/network/p2p.c
+    # Removed: src/network/protocol.c
+    # Removed: src/network/p2p.c
 )
 
 # Storage sources (when implemented)
