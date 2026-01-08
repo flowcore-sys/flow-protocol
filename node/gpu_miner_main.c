@@ -784,13 +784,13 @@ static bool submit_block(int node_idx, ftc_block_t* block)
         return false;
     }
 
-    /* Set timeouts - need to wait for response */
+    /* Set timeouts - short to minimize GPU idle time */
 #ifdef _WIN32
-    DWORD timeout = 5000;  /* 5 seconds */
+    DWORD timeout = 1000;  /* 1 second */
     setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, (char*)&timeout, sizeof(timeout));
     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (char*)&timeout, sizeof(timeout));
 #else
-    struct timeval tv = {5, 0};  /* 5 seconds */
+    struct timeval tv = {1, 0};  /* 1 second */
     setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 #endif
