@@ -804,7 +804,7 @@ static ftc_mempool_t* rpc_get_mempool(void* ctx)
 static bool rpc_get_balance(void* ctx, const ftc_address_t addr, uint64_t* balance)
 {
     ftc_node_t* node = (ftc_node_t*)ctx;
-    *balance = ftc_utxo_set_balance(node->utxo_set, addr, node->best_height);
+    *balance = ftc_utxo_set_balance(node->utxo_set, addr, node->chain->best_height);
     return true;
 }
 
