@@ -326,6 +326,24 @@ bool ftc_json_parse_uint(const char* json, const char* key, uint64_t* out)
     return end != p;
 }
 
+/* Extract nth quoted string from params array (0-indexed) */
+static const char* extract_param_string(const char* params, int n, char* out, size_t out_len)
+{
+    const char* p = params;
+    for (int i = 0; i <= n; i++) {
+        p = strchr(p, '"');
+        if (!p) return NULL;
+        if (i < n) { p++; p = strchr(p, '"'); if (p) p++; }
+    }
+    p++;
+    size_t i = 0;
+    while (*p && *p != '"' && i < out_len - 1) {
+        out[i++] = *p++;
+    }
+    out[i] = '\0';
+    return out;
+}
+
 bool ftc_json_parse_bool(const char* json, const char* key, bool* out)
 {
     const char* p = find_key(json, key);
@@ -718,17 +736,7 @@ static void rpc_getbalance(ftc_rpc_server_t* rpc, ftc_json_t* json, const char* 
 {
     /* Parse address from params */
     char addr_str[128] = {0};
-
-    /* Try to find address in params array */
-    const char* p = strchr(params, '"');
-    if (p) {
-        p++;
-        size_t i = 0;
-        while (*p && *p != '"' && i < sizeof(addr_str) - 1) {
-            addr_str[i++] = *p++;
-        }
-        addr_str[i] = '\0';
-    }
+    extract_param_string(params, 0, addr_str, sizeof(addr_str));
 
     uint64_t balance = 0;
 
@@ -753,16 +761,7 @@ static void rpc_getblock(ftc_rpc_server_t* rpc, ftc_json_t* json, const char* pa
 {
     /* Parse hash or height from params */
     char hash_str[128] = {0};
-
-    const char* p = strchr(params, '"');
-    if (p) {
-        p++;
-        size_t i = 0;
-        while (*p && *p != '"' && i < sizeof(hash_str) - 1) {
-            hash_str[i++] = *p++;
-        }
-        hash_str[i] = '\0';
-    }
+    extract_param_string(params, 0, hash_str, sizeof(hash_str));
 
     ftc_block_t* block = NULL;
 
@@ -835,16 +834,7 @@ static void rpc_getblock(ftc_rpc_server_t* rpc, ftc_json_t* json, const char* pa
 static void rpc_gettransaction(ftc_rpc_server_t* rpc, ftc_json_t* json, const char* params, const char* id)
 {
     char txid_str[128] = {0};
-
-    const char* p = strchr(params, '"');
-    if (p) {
-        p++;
-        size_t i = 0;
-        while (*p && *p != '"' && i < sizeof(txid_str) - 1) {
-            txid_str[i++] = *p++;
-        }
-        txid_str[i] = '\0';
-    }
+    extract_param_string(params, 0, txid_str, sizeof(txid_str));
 
     ftc_tx_t* tx = NULL;
 
@@ -979,81 +969,34 @@ static void rpc_sendtoaddress(ftc_rpc_server_t* rpc, ftc_json_t* json, const cha
     char pubkey_hex[128] = {0};
     char to_addr_str[64] = {0};
     double amount_ftc = 0;
-    double fee_ftc = 0.0001;  /* Default fee: 0.0001 FTC */
+    double fee_ftc = 0.0001;
 
-    /* Parse private key hex */
-    const char* p = strchr(params, '"');
-    if (!p) {
-        rpc_error(json, -1, "Missing private key", id);
-        return;
-    }
-    p++;
-    size_t i = 0;
-    while (*p && *p != '"' && i < sizeof(privkey_hex) - 1) {
-        privkey_hex[i++] = *p++;
-    }
-    privkey_hex[i] = '\0';
-
-    if (strlen(privkey_hex) != 64) {
+    /* Parse string params */
+    if (!extract_param_string(params, 0, privkey_hex, sizeof(privkey_hex)) || strlen(privkey_hex) != 64) {
         rpc_error(json, -1, "Invalid private key (must be 64 hex chars)", id);
         return;
     }
-
-    /* Parse public key hex */
-    p = strchr(p + 1, '"');
-    if (!p) {
-        rpc_error(json, -1, "Missing public key", id);
-        return;
-    }
-    p++;
-    i = 0;
-    while (*p && *p != '"' && i < sizeof(pubkey_hex) - 1) {
-        pubkey_hex[i++] = *p++;
-    }
-    pubkey_hex[i] = '\0';
-
-    if (strlen(pubkey_hex) != 64) {
+    if (!extract_param_string(params, 1, pubkey_hex, sizeof(pubkey_hex)) || strlen(pubkey_hex) != 64) {
         rpc_error(json, -1, "Invalid public key (must be 64 hex chars)", id);
         return;
     }
-
-    /* Parse to address */
-    p = strchr(p + 1, '"');
-    if (!p) {
+    if (!extract_param_string(params, 2, to_addr_str, sizeof(to_addr_str))) {
         rpc_error(json, -1, "Missing destination address", id);
         return;
     }
-    p++;
-    i = 0;
-    while (*p && *p != '"' && i < sizeof(to_addr_str) - 1) {
-        to_addr_str[i++] = *p++;
-    }
-    to_addr_str[i] = '\0';
 
-    /* Parse amount */
-    p = strchr(p + 1, ',');
-    if (!p) {
-        rpc_error(json, -1, "Missing amount", id);
-        return;
-    }
-    p++;
-    while (*p == ' ') p++;
-    amount_ftc = strtod(p, NULL);
-    if (amount_ftc <= 0) {
+    /* Parse amount (4th param after 3 strings) */
+    const char* p = params;
+    for (int i = 0; i < 3; i++) { p = strchr(p, '"'); if (p) p = strchr(p + 1, '"'); if (p) p++; }
+    p = strchr(p, ',');
+    if (!p || (amount_ftc = strtod(p + 1, NULL)) <= 0) {
         rpc_error(json, -1, "Invalid amount", id);
         return;
     }
 
     /* Parse optional fee */
-    p = strchr(p, ',');
-    if (p) {
-        p++;
-        while (*p == ' ') p++;
-        double parsed_fee = strtod(p, NULL);
-        if (parsed_fee > 0) {
-            fee_ftc = parsed_fee;
-        }
-    }
+    p = strchr(p + 1, ',');
+    if (p) { double f = strtod(p + 1, NULL); if (f > 0) fee_ftc = f; }
 
     /* Convert amounts to satoshis */
     uint64_t amount = (uint64_t)(amount_ftc * FTC_COIN);
@@ -1192,16 +1135,7 @@ static void rpc_listunspent(ftc_rpc_server_t* rpc, ftc_json_t* json, const char*
 {
     /* Parse address from params */
     char addr_str[128] = {0};
-
-    const char* p = strchr(params, '"');
-    if (p) {
-        p++;
-        size_t i = 0;
-        while (*p && *p != '"' && i < sizeof(addr_str) - 1) {
-            addr_str[i++] = *p++;
-        }
-        addr_str[i] = '\0';
-    }
+    extract_param_string(params, 0, addr_str, sizeof(addr_str));
 
     if (!addr_str[0]) {
         rpc_error(json, -1, "Missing address", id);
@@ -1291,16 +1225,7 @@ static void rpc_getblocktemplate(ftc_rpc_server_t* rpc, ftc_json_t* json, const 
 
     /* Parse miner address from params */
     char addr_str[64] = {0};
-
-    const char* p = strchr(params, '"');
-    if (p) {
-        p++;
-        size_t i = 0;
-        while (*p && *p != '"' && i < sizeof(addr_str) - 1) {
-            addr_str[i++] = *p++;
-        }
-        addr_str[i] = '\0';
-    }
+    extract_param_string(params, 0, addr_str, sizeof(addr_str));
 
     if (!addr_str[0]) {
         rpc_error(json, -1, "Missing miner address", id);

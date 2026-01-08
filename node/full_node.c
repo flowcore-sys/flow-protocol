@@ -53,6 +53,29 @@ static ftc_chain_t* chain_new(void)
     return chain;
 }
 
+/* Clone a block by serializing and deserializing */
+static ftc_block_t* clone_block(ftc_block_t* block)
+{
+    size_t size = ftc_block_serialize(block, NULL, 0);
+    uint8_t* data = (uint8_t*)malloc(size);
+    if (!data) return NULL;
+    ftc_block_serialize(block, data, size);
+    ftc_block_t* copy = ftc_block_deserialize(data, size);
+    free(data);
+    return copy;
+}
+
+/* Expand block array capacity */
+static bool expand_block_array(ftc_chain_t* chain)
+{
+    int new_cap = chain->block_capacity * 2;
+    ftc_block_t** new_blocks = (ftc_block_t**)realloc(chain->blocks, new_cap * sizeof(ftc_block_t*));
+    if (!new_blocks) return false;
+    chain->blocks = new_blocks;
+    chain->block_capacity = new_cap;
+    return true;
+}
+
 /* Hash index helper functions for O(1) block lookups */
 static inline uint32_t hash_index_slot(const ftc_hash256_t hash)
 {
@@ -273,59 +296,47 @@ static int ftc_chain_load(ftc_node_t* node, const char* path)
 
             /* Expand if needed */
             if (chain->block_count >= chain->block_capacity) {
-                int new_cap = chain->block_capacity * 2;
-                ftc_block_t** new_blocks = (ftc_block_t**)realloc(chain->blocks, new_cap * sizeof(ftc_block_t*));
-                if (new_blocks) {
-                    chain->blocks = new_blocks;
-                    chain->block_capacity = new_cap;
-                }
+                expand_block_array(chain);
             }
 
             /* Clone block for storage */
-            size_t block_size = ftc_block_serialize(block, NULL, 0);
-            uint8_t* block_data_copy = (uint8_t*)malloc(block_size);
-            if (block_data_copy) {
-                ftc_block_serialize(block, block_data_copy, block_size);
-                ftc_block_t* block_copy = ftc_block_deserialize(block_data_copy, block_size);
-                free(block_data_copy);
+            ftc_block_t* block_copy = clone_block(block);
+            if (block_copy) {
+                ftc_hash256_t block_hash;
+                ftc_block_hash(block, block_hash);
 
-                if (block_copy) {
-                    ftc_hash256_t block_hash;
-                    ftc_block_hash(block, block_hash);
+                chain->blocks[chain->block_count++] = block_copy;
+                chain->best_height++;
+                memcpy(chain->best_hash, block_hash, 32);
+                hash_index_add(chain, block_hash, chain->block_count - 1);
 
-                    chain->blocks[chain->block_count++] = block_copy;
-                    chain->best_height++;
-                    memcpy(chain->best_hash, block_hash, 32);
-                    hash_index_add(chain, block_hash, chain->block_count - 1);
+                /* Update UTXO set */
+                for (uint32_t t = 0; t < block->tx_count; t++) {
+                    ftc_tx_t* tx = block->txs[t];
+                    ftc_hash256_t txid;
+                    ftc_tx_hash(tx, txid);
 
-                    /* Update UTXO set */
-                    for (uint32_t t = 0; t < block->tx_count; t++) {
-                        ftc_tx_t* tx = block->txs[t];
-                        ftc_hash256_t txid;
-                        ftc_tx_hash(tx, txid);
-
-                        /* Remove spent UTXOs */
-                        if (!ftc_tx_is_coinbase(tx)) {
-                            for (uint32_t j = 0; j < tx->input_count; j++) {
-                                ftc_utxo_t* spent = ftc_utxo_set_remove(node->utxo_set, tx->inputs[j].prev_txid, tx->inputs[j].vout);
-                                if (spent) ftc_utxo_free(spent);
-                            }
-                        }
-
-                        /* Add new UTXOs */
-                        for (uint32_t j = 0; j < tx->output_count; j++) {
-                            ftc_utxo_t utxo;
-                            memcpy(utxo.txid, txid, 32);
-                            utxo.vout = j;
-                            utxo.value = tx->outputs[j].value;
-                            memcpy(utxo.pubkey_hash, tx->outputs[j].pubkey_hash, 20);
-                            utxo.height = chain->best_height;
-                            utxo.spent = false;
-                            ftc_utxo_set_add(node->utxo_set, &utxo);
+                    /* Remove spent UTXOs */
+                    if (!ftc_tx_is_coinbase(tx)) {
+                        for (uint32_t j = 0; j < tx->input_count; j++) {
+                            ftc_utxo_t* spent = ftc_utxo_set_remove(node->utxo_set, tx->inputs[j].prev_txid, tx->inputs[j].vout);
+                            if (spent) ftc_utxo_free(spent);
                         }
                     }
-                    loaded++;
+
+                    /* Add new UTXOs */
+                    for (uint32_t j = 0; j < tx->output_count; j++) {
+                        ftc_utxo_t utxo;
+                        memcpy(utxo.txid, txid, 32);
+                        utxo.vout = j;
+                        utxo.value = tx->outputs[j].value;
+                        memcpy(utxo.pubkey_hash, tx->outputs[j].pubkey_hash, 20);
+                        utxo.height = chain->best_height;
+                        utxo.spent = false;
+                        ftc_utxo_set_add(node->utxo_set, &utxo);
+                    }
                 }
+                loaded++;
             }
         } else {
             /* Normal mode: full validation */
@@ -373,15 +384,9 @@ bool ftc_chain_init(ftc_chain_t* chain)
     chain->best_height = 0;
 
     /* Add genesis to chain */
-    if (chain->block_count >= chain->block_capacity) {
-        int new_cap = chain->block_capacity * 2;
-        ftc_block_t** new_blocks = (ftc_block_t**)realloc(chain->blocks, new_cap * sizeof(ftc_block_t*));
-        if (!new_blocks) {
-            chain_free(chain);
-            return NULL;
-        }
-        chain->blocks = new_blocks;
-        chain->block_capacity = new_cap;
+    if (chain->block_count >= chain->block_capacity && !expand_block_array(chain)) {
+        chain_free(chain);
+        return false;
     }
 
     /* Clone genesis for storage */
@@ -428,15 +433,7 @@ bool ftc_chain_add_block(ftc_node_t* node, ftc_block_t* block)
     FTC_MUTEX_UNLOCK(chain->mutex);
 
     /* Clone block OUTSIDE the lock - this is slow */
-    size_t block_size = ftc_block_serialize(block, NULL, 0);
-    uint8_t* block_data = (uint8_t*)malloc(block_size);
-    if (!block_data) {
-        return false;
-    }
-    ftc_block_serialize(block, block_data, block_size);
-    ftc_block_t* block_copy = ftc_block_deserialize(block_data, block_size);
-    free(block_data);
-
+    ftc_block_t* block_copy = clone_block(block);
     if (!block_copy) {
         return false;
     }
@@ -460,17 +457,11 @@ bool ftc_chain_add_block(ftc_node_t* node, ftc_block_t* block)
     }
 
     /* Expand if needed */
-    if (chain->block_count >= chain->block_capacity) {
-        int new_cap = chain->block_capacity * 2;
-        ftc_block_t** new_blocks = (ftc_block_t**)realloc(chain->blocks, new_cap * sizeof(ftc_block_t*));
-        if (!new_blocks) {
-            printf("[NODE] Failed to expand block storage\n");
-            FTC_MUTEX_UNLOCK(chain->mutex);
-            ftc_block_free(block_copy);
-            return false;
-        }
-        chain->blocks = new_blocks;
-        chain->block_capacity = new_cap;
+    if (chain->block_count >= chain->block_capacity && !expand_block_array(chain)) {
+        printf("[NODE] Failed to expand block storage\n");
+        FTC_MUTEX_UNLOCK(chain->mutex);
+        ftc_block_free(block_copy);
+        return false;
     }
 
     chain->blocks[chain->block_count++] = block_copy;

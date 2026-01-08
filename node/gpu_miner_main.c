@@ -56,6 +56,47 @@ typedef int miner_socket_t;
 #endif
 
 /*==============================================================================
+ * SOCKET HELPERS
+ *============================================================================*/
+
+static inline void close_socket(miner_socket_t sock) {
+#ifdef _WIN32
+    closesocket(sock);
+#else
+    close(sock);
+#endif
+}
+
+static inline miner_socket_t create_tcp_socket(void) {
+    return socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+}
+
+static inline void set_socket_nonblocking(miner_socket_t sock) {
+#ifdef _WIN32
+    u_long mode = 1;
+    ioctlsocket(sock, FIONBIO, &mode);
+#else
+    int flags = fcntl(sock, F_GETFL, 0);
+    fcntl(sock, F_SETFL, flags | O_NONBLOCK);
+#endif
+}
+
+static inline int socket_would_block(void) {
+#ifdef _WIN32
+    return WSAGetLastError() == WSAEWOULDBLOCK;
+#else
+    return errno == EINPROGRESS;
+#endif
+}
+
+static void bytes_to_hex(const uint8_t* data, size_t len, char* hex) {
+    for (size_t i = 0; i < len; i++) {
+        sprintf(hex + i * 2, "%02x", data[i]);
+    }
+    hex[len * 2] = '\0';
+}
+
+/*==============================================================================
  * ANSI COLORS (Rigel-style)
  *============================================================================*/
 
@@ -293,16 +334,10 @@ static bool is_local_ip(const char* ip)
 /* Quick connectivity test (returns latency or 9999 if unreachable) */
 static int quick_connect_test(const char* ip, uint16_t port)
 {
-    miner_socket_t sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    miner_socket_t sock = create_tcp_socket();
     if (sock == MINER_INVALID_SOCKET) return 9999;
 
-#ifdef _WIN32
-    u_long mode = 1;
-    ioctlsocket(sock, FIONBIO, &mode);
-#else
-    int flags = fcntl(sock, F_GETFL, 0);
-    fcntl(sock, F_SETFL, flags | O_NONBLOCK);
-#endif
+set_socket_nonblocking(sock);
 
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
@@ -320,11 +355,7 @@ static int quick_connect_test(const char* ip, uint16_t port)
     struct timeval tv = {1, 0};  /* 1 second timeout */
     int ret = select((int)sock + 1, NULL, &writefds, NULL, &tv);
 
-#ifdef _WIN32
-    closesocket(sock);
-#else
-    close(sock);
-#endif
+close_socket(sock);
 
     if (ret > 0) {
         return (int)(get_time_ms() - start);
@@ -397,16 +428,10 @@ static void discover_nodes(void)
 
 static int measure_latency(const char* host, uint16_t port)
 {
-    miner_socket_t sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    miner_socket_t sock = create_tcp_socket();
     if (sock == MINER_INVALID_SOCKET) return 9999;
 
-#ifdef _WIN32
-    u_long mode = 1;
-    ioctlsocket(sock, FIONBIO, &mode);
-#else
-    int flags = fcntl(sock, F_GETFL, 0);
-    fcntl(sock, F_SETFL, flags | O_NONBLOCK);
-#endif
+set_socket_nonblocking(sock);
 
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
@@ -417,18 +442,9 @@ static int measure_latency(const char* host, uint16_t port)
     int64_t start = get_time_ms();
 
     int ret = connect(sock, (struct sockaddr*)&addr, sizeof(addr));
-    if (ret != 0) {
-#ifdef _WIN32
-        if (WSAGetLastError() != WSAEWOULDBLOCK) {
-            closesocket(sock);
-            return 9999;
-        }
-#else
-        if (errno != EINPROGRESS) {
-            close(sock);
-            return 9999;
-        }
-#endif
+    if (ret != 0 && !socket_would_block()) {
+        close_socket(sock);
+        return 9999;
     }
 
     fd_set wset;
@@ -438,21 +454,13 @@ static int measure_latency(const char* host, uint16_t port)
 
     ret = select((int)sock + 1, NULL, &wset, NULL, &tv);
     if (ret <= 0) {
-#ifdef _WIN32
-        closesocket(sock);
-#else
-        close(sock);
-#endif
+close_socket(sock);
         return 9999;
     }
 
     int64_t elapsed = get_time_ms() - start;
 
-#ifdef _WIN32
-    closesocket(sock);
-#else
-    close(sock);
-#endif
+close_socket(sock);
 
     return (int)elapsed;
 }
@@ -492,7 +500,7 @@ static char* rpc_call(int node_idx, const char* method, const char* params)
 
     node_info_t* node = &g_nodes[node_idx];
 
-    miner_socket_t sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    miner_socket_t sock = create_tcp_socket();
     if (sock == MINER_INVALID_SOCKET) return NULL;
 
 #ifdef _WIN32
@@ -512,11 +520,7 @@ static char* rpc_call(int node_idx, const char* method, const char* params)
     addr.sin_port = htons(node->port);
 
     if (connect(sock, (struct sockaddr*)&addr, sizeof(addr)) != 0) {
-#ifdef _WIN32
-        closesocket(sock);
-#else
-        close(sock);
-#endif
+close_socket(sock);
         node->failures++;
         return NULL;
     }
@@ -540,11 +544,7 @@ static char* rpc_call(int node_idx, const char* method, const char* params)
 
     char* response = (char*)malloc(65536);
     if (!response) {
-#ifdef _WIN32
-        closesocket(sock);
-#else
-        close(sock);
-#endif
+close_socket(sock);
         return NULL;
     }
 
@@ -559,11 +559,7 @@ static char* rpc_call(int node_idx, const char* method, const char* params)
     }
     response[total] = '\0';
 
-#ifdef _WIN32
-    closesocket(sock);
-#else
-    close(sock);
-#endif
+close_socket(sock);
 
     /* Check for valid response */
     if (total == 0) {
@@ -680,9 +676,7 @@ static void submit_block_async(int node_idx, ftc_block_t* block)
         return;
     }
 
-    for (size_t i = 0; i < size; i++) {
-        sprintf(hex + i * 2, "%02x", data[i]);
-    }
+bytes_to_hex(data, size, hex);
     free(data);
 
     /* Build JSON-RPC request */
@@ -698,7 +692,7 @@ static void submit_block_async(int node_idx, ftc_block_t* block)
     free(hex);
 
     /* Open socket */
-    miner_socket_t sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    miner_socket_t sock = create_tcp_socket();
     if (sock == MINER_INVALID_SOCKET) {
         free(request);
         return;
@@ -734,11 +728,7 @@ static void submit_block_async(int node_idx, ftc_block_t* block)
         /* Don't wait for response - just close and continue mining */
     }
 
-#ifdef _WIN32
-    closesocket(sock);
-#else
-    close(sock);
-#endif
+close_socket(sock);
     free(request);
 }
 
@@ -760,9 +750,7 @@ static bool submit_block(int node_idx, ftc_block_t* block)
         return false;
     }
 
-    for (size_t i = 0; i < size; i++) {
-        sprintf(hex + i * 2, "%02x", data[i]);
-    }
+bytes_to_hex(data, size, hex);
     free(data);
 
     /* Build JSON-RPC request */
@@ -778,7 +766,7 @@ static bool submit_block(int node_idx, ftc_block_t* block)
     free(hex);
 
     /* Open socket */
-    miner_socket_t sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    miner_socket_t sock = create_tcp_socket();
     if (sock == MINER_INVALID_SOCKET) {
         free(request);
         return false;
@@ -836,11 +824,7 @@ static bool submit_block(int node_idx, ftc_block_t* block)
         }
     }
 
-#ifdef _WIN32
-    closesocket(sock);
-#else
-    close(sock);
-#endif
+close_socket(sock);
     free(request);
     return accepted;
 }
