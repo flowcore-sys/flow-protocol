@@ -1185,31 +1185,42 @@ int main(int argc, char* argv[])
         return 1;
     }
 
-    /* Discover nodes and select best one */
-    discover_nodes();
+    /* Discover nodes and connect with retry */
+    printf("Connecting to FTC network...\n");
 
-    if (g_node_count == 0) {
-        fprintf(stderr, "Error: No nodes found. Check your internet connection.\n");
-        ftc_gpu_farm_free(g_farm);
-        ftc_gpu_shutdown();
-        return 1;
+    while (g_running) {
+        discover_nodes();
+
+        if (g_node_count == 0) {
+            printf("Searching for nodes... (retry in 3s)\n");
+            usleep(3000000);
+            continue;
+        }
+
+        update_node_latencies();
+        g_active_node = select_best_node();
+
+        if (g_active_node < 0) {
+            printf("Nodes unreachable, retrying in 3s...\n");
+            usleep(3000000);
+            continue;
+        }
+
+        if (get_node_info(g_active_node)) {
+            printf("Connected to %s (latency: %dms)\n",
+                   g_nodes[g_active_node].ip,
+                   g_nodes[g_active_node].latency_ms);
+            break;  /* Successfully connected */
+        }
+
+        printf("Connection failed, retrying in 3s...\n");
+        usleep(3000000);
     }
 
-    update_node_latencies();
-
-    g_active_node = select_best_node();
-    if (g_active_node < 0) {
-        fprintf(stderr, "Error: All nodes unreachable.\n");
+    if (!g_running) {
         ftc_gpu_farm_free(g_farm);
         ftc_gpu_shutdown();
-        return 1;
-    }
-
-    if (!get_node_info(g_active_node)) {
-        fprintf(stderr, "Error: Cannot connect to node %s\n", g_nodes[g_active_node].ip);
-        ftc_gpu_farm_free(g_farm);
-        ftc_gpu_shutdown();
-        return 1;
+        return 0;
     }
 
     /* Start mining - clear screen immediately for static display */
