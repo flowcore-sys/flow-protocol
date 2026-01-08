@@ -13,6 +13,7 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#include <io.h>
 #else
 #include <unistd.h>
 #endif
@@ -211,6 +212,11 @@ static bool ftc_chain_save(ftc_chain_t* chain, const char* path)
 
     /* Flush to disk before rename */
     fflush(f);
+#ifdef _WIN32
+    _commit(_fileno(f));  /* Force write to disk on Windows */
+#else
+    fsync(fileno(f));     /* Force write to disk on Linux */
+#endif
     fclose(f);
 
     /* Atomic rename: remove old file and rename temp */
@@ -512,7 +518,11 @@ bool ftc_chain_add_block(ftc_node_t* node, ftc_block_t* block)
 
     FTC_MUTEX_UNLOCK(chain->mutex);
 
-    /* Note: blocks.dat is only saved on shutdown for better performance */
+    /* Save immediately for crash safety */
+    char blocks_path[512];
+    snprintf(blocks_path, sizeof(blocks_path), "%s/blocks.dat", node->config.data_dir);
+    ftc_chain_save(chain, blocks_path);
+
     return true;
 }
 
