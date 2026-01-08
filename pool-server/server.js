@@ -1,5 +1,5 @@
 /**
- * FTC Mining Pool Server v1.2.0
+ * FTC Mining Pool Server v1.2.8
  * Stratum Protocol + HTTP Stats API
  * Fixed: block detection, hashrate calculation, difficulty formula
  */
@@ -18,6 +18,9 @@ const CONFIG = {
     POOL_DIFFICULTY: parseFloat(process.env.POOL_DIFFICULTY) || 1,
     POOL_FEE: parseFloat(process.env.POOL_FEE) || 0.01,
     POOL_ADDRESS: process.env.POOL_ADDRESS || '1FNSduApfZwckr9mEmKb7XBnmP4yhni857',
+    POOL_PRIVKEY: process.env.POOL_PRIVKEY || '',  // Required for payouts
+    POOL_PUBKEY: process.env.POOL_PUBKEY || '',    // Required for payouts
+    TX_FEE: parseFloat(process.env.TX_FEE) || 0.0001,  // Fee per payout tx
 
     // HTTP Stats API
     HTTP_PORT: parseInt(process.env.HTTP_PORT) || 8080,
@@ -34,10 +37,11 @@ const CONFIG = {
     EXTRANONCE2_SIZE: 4,
 
     // Vardiff settings
-    VARDIFF_MIN: 0.00001,
-    VARDIFF_MAX: 65536,
+    // Vardiff disabled - miner doesn't update GPU target on difficulty change
+    VARDIFF_MIN: 1,
+    VARDIFF_MAX: 1,
     VARDIFF_TARGET_TIME: 15,
-    VARDIFF_RETARGET: 60,
+    VARDIFF_RETARGET: 86400,  // 24 hours (effectively disabled)
     VARDIFF_VARIANCE: 0.3,
 };
 
@@ -247,6 +251,80 @@ async function submitBlock(blockHex) {
     }
 }
 
+async function getPoolBalance() {
+    try {
+        const balance = await rpcCall('getbalance', [CONFIG.POOL_ADDRESS]);
+        return balance || 0;
+    } catch (e) {
+        log('ERROR', `getPoolBalance failed: ${e.message}`);
+        return 0;
+    }
+}
+
+// Block reward = 50 FTC (adjust if different)
+const BLOCK_REWARD = 50;
+
+async function processPayouts(blockHeight) {
+    if (!CONFIG.POOL_PRIVKEY || !CONFIG.POOL_PUBKEY) {
+        log('WARN', 'Payouts disabled - POOL_PRIVKEY/POOL_PUBKEY not configured');
+        return;
+    }
+
+    const totalShares = g_stats.sharesAccepted;
+    if (totalShares === 0) {
+        log('WARN', 'No shares to distribute payouts');
+        return;
+    }
+
+    // Calculate reward after pool fee
+    const poolFeeAmount = BLOCK_REWARD * CONFIG.POOL_FEE;
+    const minerReward = BLOCK_REWARD - poolFeeAmount;
+
+    log('INFO', `Processing payouts for block ${blockHeight}: ${minerReward} FTC to distribute (${CONFIG.POOL_FEE * 100}% fee)`);
+
+    // Calculate and send payouts to each worker
+    for (const [workerAddr, w] of g_workers) {
+        if (w.sharesAccepted === 0) continue;
+
+        const sharePercent = w.sharesAccepted / totalShares;
+        const payout = minerReward * sharePercent - CONFIG.TX_FEE;
+
+        if (payout <= 0) {
+            log('INFO', `Skipping ${workerAddr}: payout ${payout.toFixed(8)} too small`);
+            continue;
+        }
+
+        try {
+            // sendtoaddress: [privkey, pubkey, to_address, amount, fee]
+            const result = await rpcCall('sendtoaddress', [
+                CONFIG.POOL_PRIVKEY,
+                CONFIG.POOL_PUBKEY,
+                workerAddr,
+                payout,
+                CONFIG.TX_FEE
+            ]);
+
+            if (result && result.txid) {
+                log('INFO', `PAYOUT: ${payout.toFixed(8)} FTC -> ${workerAddr} (${(sharePercent * 100).toFixed(2)}%) txid=${result.txid.substring(0, 16)}...`);
+            } else {
+                log('ERROR', `Payout failed to ${workerAddr}: ${JSON.stringify(result)}`);
+            }
+        } catch (e) {
+            log('ERROR', `Payout error to ${workerAddr}: ${e.message}`);
+        }
+    }
+
+    // Reset share counts after payout
+    for (const [, w] of g_workers) {
+        w.sharesAccepted = 0;
+        w.sharesRejected = 0;
+    }
+    g_stats.sharesAccepted = 0;
+    g_stats.sharesRejected = 0;
+
+    log('INFO', 'Payouts complete, share counts reset');
+}
+
 async function updateJob() {
     const template = await getBlockTemplate();
     if (!template) return false;
@@ -411,6 +489,12 @@ class StratumClient {
             case 'mining.extranonce.subscribe':
                 this.send({ id, result: true, error: null });
                 break;
+            case 'mining.hashrate':
+                // Miner reports its actual hashrate - use this instead of estimation
+                this.hashrate = params[0] || 0;
+                this.hasReportedHashrate = true;  // Skip share-based estimation
+                this.send({ id, result: true, error: null });
+                break;
             default:
                 this.send({ id, result: null, error: [20, 'Unknown method', null] });
         }
@@ -482,7 +566,6 @@ class StratumClient {
 
         if (shareResult.valid) {
             this.sharesAccepted++;
-            this.lastShareTime = Date.now();
             this.vardiffShareCount++;
             g_stats.sharesAccepted++;
 
@@ -492,8 +575,9 @@ class StratumClient {
                 w.lastShare = Date.now();
             }
 
-            // Estimate hashrate from pool difficulty and time between shares
-            this.updateHashrate();
+            // Estimate hashrate using actual share difficulty
+            this.updateHashrate(shareResult.diff);
+            this.lastShareTime = Date.now();
 
             this.send({ id, result: true, error: null });
 
@@ -505,6 +589,9 @@ class StratumClient {
                 g_stats.lastBlockHeight = g_blockHeight;
                 if (g_workers.has(worker)) g_workers.get(worker).blocksFound++;
                 this.submitBlockFromShare(extranonce2, ntime, nonce);
+
+                // Process payouts to miners after block is confirmed
+                setTimeout(() => processPayouts(g_blockHeight), 5000);
             }
         } else {
             this.sharesRejected++;
@@ -516,15 +603,32 @@ class StratumClient {
         this.checkVardiff();
     }
 
-    updateHashrate() {
-        // Hashrate = pool_difficulty * 2^32 / time_between_shares
-        // Use pool difficulty (this.difficulty) rather than share diff which has wrong scale for FTC
+    updateHashrate(shareDiff) {
+        // Skip if miner reports hashrate directly via mining.hashrate
+        if (this.hasReportedHashrate) return;
+
+        // Calculate hashrate using a rolling window of shares
+        // Use actual share difficulty (hashDiff), not pool difficulty
         const now = Date.now();
-        if (this.lastShareTime) {
-            const elapsed = (now - this.lastShareTime) / 1000;
-            if (elapsed > 0 && elapsed < 300) {
-                this.hashrate = (this.difficulty * 4294967296) / elapsed;
-            }
+        const windowMs = 60000; // 60 second window
+
+        if (!this.shareHistory) this.shareHistory = [];
+
+        // Add current share with its actual difficulty
+        this.shareHistory.push({ time: now, diff: shareDiff });
+
+        // Remove shares older than window
+        this.shareHistory = this.shareHistory.filter(s => now - s.time < windowMs);
+
+        // Calculate total work in window
+        // Calibrated: 65M gave 3.55 GH/s for 1.11 GH/s actual, so divide by 3.2
+        const FTC_HASHES_PER_DIFF = 20000000;  // ~2^24
+        const totalWork = this.shareHistory.reduce((sum, s) => sum + s.diff * FTC_HASHES_PER_DIFF, 0);
+        const windowSec = Math.min((now - this.connectTime) / 1000, windowMs / 1000);
+
+        if (windowSec > 0) {
+            this.hashrate = totalWork / windowSec;
+            log('DEBUG', `Hashrate calc: shares=${this.shareHistory.length} work=${totalWork} window=${windowSec.toFixed(1)}s HR=${formatHashrate(this.hashrate)}`);
         }
     }
 
@@ -691,7 +795,7 @@ function broadcastJob() {
 // ============================================================================
 
 function startHttpServer() {
-    const httpServer = http.createServer((req, res) => {
+    const httpServer = http.createServer(async (req, res) => {
         // CORS headers
         res.setHeader('Access-Control-Allow-Origin', '*');
         res.setHeader('Access-Control-Allow-Methods', 'GET');
@@ -703,11 +807,34 @@ function startHttpServer() {
                 totalHashrate += client.hashrate || 0;
             }
 
+            // Get pool balance
+            const poolBalance = await getPoolBalance();
+
+            // Calculate worker shares and percentages
+            const totalShares = g_stats.sharesAccepted;
+            const workerStats = [];
+            for (const [, w] of g_workers) {
+                const percentage = totalShares > 0 ? (w.sharesAccepted / totalShares) * 100 : 0;
+                const estimatedEarnings = poolBalance * (percentage / 100);
+                workerStats.push({
+                    name: w.name,
+                    shares: w.sharesAccepted,
+                    percentage: percentage.toFixed(2) + '%',
+                    estimatedFTC: estimatedEarnings.toFixed(8),
+                    blocksFound: w.blocksFound,
+                    online: w.connections > 0
+                });
+            }
+            workerStats.sort((a, b) => b.shares - a.shares);
+
             const stats = {
                 pool: {
                     name: 'FTC Mining Pool',
-                    version: '1.2.0',
+                    version: '1.2.8',
                     fee: CONFIG.POOL_FEE * 100 + '%',
+                    address: CONFIG.POOL_ADDRESS,
+                    balance: poolBalance,
+                    balanceFTC: poolBalance.toFixed(8) + ' FTC',
                     uptime: formatUptime(Date.now() - g_stats.startTime),
                     uptimeMs: Date.now() - g_stats.startTime,
                 },
@@ -733,11 +860,12 @@ function startHttpServer() {
                     lastFoundAt: g_stats.lastBlockTime,
                     lastFoundHeight: g_stats.lastBlockHeight,
                 },
+                workers: workerStats,
                 timestamp: Date.now(),
             };
 
             res.setHeader('Content-Type', 'application/json');
-            res.end(JSON.stringify(stats, null, 2));
+            res.end(JSON.stringify(stats));  // No formatting - miner parser needs compact JSON
 
         } else if (req.url === '/api/miners' || req.url === '/miners') {
             // List connected miners
@@ -759,7 +887,7 @@ function startHttpServer() {
             }
 
             res.setHeader('Content-Type', 'application/json');
-            res.end(JSON.stringify({ miners, count: miners.length }, null, 2));
+            res.end(JSON.stringify({ miners, count: miners.length }));
 
         } else if (req.url === '/api/workers' || req.url === '/workers') {
             // Worker statistics
@@ -778,7 +906,7 @@ function startHttpServer() {
             }
 
             res.setHeader('Content-Type', 'application/json');
-            res.end(JSON.stringify({ workers }, null, 2));
+            res.end(JSON.stringify({ workers }));
 
         } else if (req.url === '/' || req.url === '/index.html') {
             // Simple HTML dashboard
@@ -894,7 +1022,7 @@ function generateDashboardHtml() {
         </div>
 
         <div class="footer">
-            FTC Pool v1.2.0 | Stratum: pool.flowprotocol.net:3333 | Auto-refresh: 10s
+            FTC Pool v1.2.8 | Stratum: pool.flowprotocol.net:3333 | Auto-refresh: 10s
         </div>
     </div>
 </body>
@@ -907,7 +1035,7 @@ function generateDashboardHtml() {
 
 async function startServer() {
     log('INFO', '═'.repeat(60));
-    log('INFO', 'FTC Mining Pool Server v1.2.0');
+    log('INFO', 'FTC Mining Pool Server v1.2.8');
     log('INFO', '═'.repeat(60));
     log('INFO', `Node: ${CONFIG.NODE_HOST}:${CONFIG.NODE_RPC_PORT}`);
     log('INFO', `Stratum port: ${CONFIG.POOL_PORT}`);

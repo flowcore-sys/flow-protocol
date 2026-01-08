@@ -131,7 +131,7 @@ static void bytes_to_hex(const uint8_t* data, size_t len, char* hex) {
  * CONSTANTS
  *============================================================================*/
 
-#define MINER_VERSION       "2.5.0"
+#define MINER_VERSION       "2.7.2"
 #define DEFAULT_POOL        "pool.flowprotocol.net:3333"
 #define MINER_NAME          "FTC-GPU-Miner"
 #define MAX_NODES           16
@@ -210,6 +210,9 @@ typedef struct {
     uint64_t shares_accepted;
     uint64_t shares_rejected;
     int blocks_found;
+    double network_difficulty;
+    int network_height;
+    double pool_balance;
     int64_t last_update;
     bool valid;
 } pool_stats_t;
@@ -449,6 +452,19 @@ static void fetch_pool_stats(void)
     g_pool_stats.shares_accepted = (uint64_t)json_get_int(body, "accepted");
     g_pool_stats.shares_rejected = (uint64_t)json_get_int(body, "rejected");
     g_pool_stats.blocks_found = json_get_int(body, "found");
+
+    /* Parse nested "network" object for height and difficulty */
+    const char* network = strstr(body, "\"network\"");
+    if (network) {
+        g_pool_stats.network_difficulty = json_get_double(network, "difficulty");
+        g_pool_stats.network_height = json_get_int(network, "height");
+    }
+
+    /* Parse nested "pool" object for balance */
+    const char* pool = strstr(body, "\"pool\"");
+    if (pool) {
+        g_pool_stats.pool_balance = json_get_double(pool, "balance");
+    }
     g_pool_stats.valid = true;
 }
 
@@ -999,21 +1015,16 @@ static void stratum_handle_message(stratum_ctx_t* ctx, const char* line)
     } else if (strstr(line, "mining.set_difficulty")) {
         stratum_parse_difficulty(ctx, line);
     } else if (strstr(line, "\"result\":true") && strstr(line, "\"id\":")) {
-        /* Share accepted */
+        /* Share accepted - count but don't log */
         ctx->shares_accepted++;
         ctx->last_share_time = time(NULL);
-        log_to_buffer("ACCEPTED share #%llu (%.1f%% rate)",
-                  (unsigned long long)ctx->shares_accepted,
-                  ctx->shares_sent > 0 ? (100.0 * ctx->shares_accepted / ctx->shares_sent) : 0.0);
     } else if (strstr(line, "\"result\":null") || strstr(line, "\"error\":")) {
-        /* Share rejected or error */
+        /* Share rejected or error - count but don't log */
         if (ctx->shares_sent > ctx->shares_accepted + ctx->shares_rejected + ctx->shares_stale) {
             if (strstr(line, "stale") || strstr(line, "Stale") || strstr(line, "job not found")) {
                 ctx->shares_stale++;
-                log_to_buffer("STALE share #%llu", (unsigned long long)ctx->shares_stale);
             } else {
                 ctx->shares_rejected++;
-                log_to_buffer("REJECTED share #%llu", (unsigned long long)ctx->shares_rejected);
             }
         }
     }
@@ -1094,6 +1105,18 @@ static bool stratum_submit_share(stratum_ctx_t* ctx, uint32_t nonce, uint32_t nt
         ctx->msg_id++, ctx->worker, ctx->job_id, extranonce2_hex, ntime_hex, nonce_hex);
 
     ctx->shares_sent++;
+    return stratum_send(ctx, msg);
+}
+
+static bool stratum_send_hashrate(stratum_ctx_t* ctx, double hashrate)
+{
+    if (!ctx->connected) return false;
+
+    char msg[256];
+    snprintf(msg, sizeof(msg),
+        "{\"id\":%d,\"method\":\"mining.hashrate\",\"params\":[%.0f]}",
+        ctx->msg_id++, hashrate);
+
     return stratum_send(ctx, msg);
 }
 
@@ -1516,9 +1539,12 @@ static void draw_static_display(void)
 {
     int gpu_count = ftc_gpu_farm_device_count(g_farm);
 
-    /* Fetch pool stats periodically */
+    /* Fetch pool stats and send hashrate periodically */
     if (g_mining_mode == MINING_MODE_POOL && g_stratum.connected) {
         fetch_pool_stats();
+        /* Send actual hashrate to pool for accurate Pool HR display */
+        double total_hr = ftc_gpu_farm_get_hashrate(g_farm);
+        stratum_send_hashrate(&g_stratum, total_hr);
     }
 
     /* Update GPU hashrates */
@@ -1540,23 +1566,17 @@ static void draw_static_display(void)
 
     /* Node/Pool info */
     if (g_mining_mode == MINING_MODE_POOL) {
-        uint64_t total_shares = g_stratum.shares_accepted + g_stratum.shares_rejected + g_stratum.shares_stale;
-        double accept_rate = total_shares > 0 ? (100.0 * g_stratum.shares_accepted / total_shares) : 0.0;
-
-        printf(C_CLR_LINE "Pool: " C_MAGENTA "%s:%d" C_RESET "  Latency: " C_GREEN "%dms" C_RESET "  Diff: " C_YELLOW "%.1f" C_RESET "  Jobs: " C_CYAN "%llu" C_RESET "\n",
-               g_stratum.host, g_stratum.port, g_stratum.latency_ms, g_difficulty,
+        printf(C_CLR_LINE "Pool: " C_MAGENTA "%s:%d" C_RESET "  Latency: " C_GREEN "%dms" C_RESET "  Jobs: " C_CYAN "%llu" C_RESET "\n",
+               g_stratum.host, g_stratum.port, g_stratum.latency_ms,
                (unsigned long long)g_stratum.jobs_received);
-        printf(C_CLR_LINE "Shares: " C_GREEN "%llu" C_RESET "/" C_RED "%llu" C_RESET "/" C_YELLOW "%llu" C_RESET " (A/R/S)  Rate: " C_GREEN "%.1f%%" C_RESET "\n",
-               (unsigned long long)g_stratum.shares_accepted,
-               (unsigned long long)g_stratum.shares_rejected,
-               (unsigned long long)g_stratum.shares_stale,
-               accept_rate);
 
         /* Pool stats from HTTP API */
         if (g_pool_stats.valid) {
-            printf(C_CLR_LINE "Online: " C_CYAN "%d" C_RESET " miners  Pool HR: " C_GREEN "%s" C_RESET "  Blocks: " C_YELLOW "%d" C_RESET "\n",
+            printf(C_CLR_LINE "Pool HR: " C_GREEN "%s" C_RESET "  Online: " C_CYAN "%d" C_RESET "  Height: " C_YELLOW "%d" C_RESET "  Diff: " C_YELLOW "%.2f" C_RESET "  Blocks: " C_GREEN "%d" C_RESET "\n",
+                   g_pool_stats.pool_hashrate_str,
                    g_pool_stats.miners_online,
-                   g_pool_stats.pool_hashrate_str[0] ? g_pool_stats.pool_hashrate_str : "0 H/s",
+                   g_pool_stats.network_height,
+                   g_pool_stats.network_difficulty,
                    g_pool_stats.blocks_found);
         }
     } else {
@@ -1568,8 +1588,9 @@ static void draw_static_display(void)
     }
     printf(C_CLR_LINE "================================================================================\n");
 
-    /* GPU table header */
-    printf(C_CLR_LINE C_BOLD " GPU  %-24s  %-12s  %-12s  Blocks" C_RESET "\n", "Device", "Hashrate", "Avg");
+    /* GPU table header - show "Shares" for pool mode, "Blocks" for solo */
+    const char* count_label = (g_mining_mode == MINING_MODE_POOL) ? "Shares" : "Blocks";
+    printf(C_CLR_LINE C_BOLD " GPU  %-24s  %-12s  %-12s  %s" C_RESET "\n", "Device", "Hashrate", "Avg", count_label);
     printf(C_CLR_LINE "--------------------------------------------------------------------------------\n");
 
     /* GPU rows */
@@ -1587,18 +1608,24 @@ static void draw_static_display(void)
 
     printf(C_CLR_LINE "--------------------------------------------------------------------------------\n");
 
-    /* Total row */
-    printf(C_CLR_LINE C_BOLD " SUM  %-24s  " C_GREEN "%-12s" C_RESET C_BOLD "  %-12s  " C_GREEN "%llu" C_RESET "/" C_YELLOW "%llu" C_RESET "\n",
-           "", hr_str, hr_str,
-           (unsigned long long)g_blocks_accepted,
-           (unsigned long long)g_blocks_found);
+    /* Total row - for pool mode show shares A/S (accepted/sent) */
+    if (g_mining_mode == MINING_MODE_POOL) {
+        printf(C_CLR_LINE C_BOLD " SUM  %-24s  " C_GREEN "%-12s" C_RESET C_BOLD "  %-12s  " C_GREEN "%llu" C_RESET "/" C_CYAN "%llu" C_RESET " (A/S)\n",
+               "", hr_str, hr_str,
+               (unsigned long long)g_blocks_accepted,
+               (unsigned long long)g_blocks_found);
+    } else {
+        printf(C_CLR_LINE C_BOLD " SUM  %-24s  " C_GREEN "%-12s" C_RESET C_BOLD "  %-12s  " C_GREEN "%llu" C_RESET "/" C_YELLOW "%llu" C_RESET "\n",
+               "", hr_str, hr_str,
+               (unsigned long long)g_blocks_accepted,
+               (unsigned long long)g_blocks_found);
+    }
 
     printf(C_CLR_LINE "================================================================================\n");
 
     /* Status line */
     if (g_mining_mode == MINING_MODE_POOL) {
         char conn_uptime[32];
-        char last_share_str[32];
         time_t now = time(NULL);
 
         if (g_stratum.connect_time > 0) {
@@ -1607,23 +1634,8 @@ static void draw_static_display(void)
             snprintf(conn_uptime, sizeof(conn_uptime), "N/A");
         }
 
-        if (g_stratum.last_share_time > 0) {
-            int secs = (int)(now - g_stratum.last_share_time);
-            if (secs < 60) {
-                snprintf(last_share_str, sizeof(last_share_str), "%ds ago", secs);
-            } else if (secs < 3600) {
-                snprintf(last_share_str, sizeof(last_share_str), "%dm %ds ago", secs / 60, secs % 60);
-            } else {
-                snprintf(last_share_str, sizeof(last_share_str), "%dh %dm ago", secs / 3600, (secs % 3600) / 60);
-            }
-        } else {
-            snprintf(last_share_str, sizeof(last_share_str), "None");
-        }
-
-        printf(C_CLR_LINE "Uptime: " C_CYAN "%s" C_RESET "  Connected: " C_GREEN "%s" C_RESET "  Last share: " C_YELLOW "%s" C_RESET "\n",
-               uptime_str, conn_uptime, last_share_str);
-        printf(C_CLR_LINE "Hashes: " C_WHITE "%.2f B" C_RESET "  Sent: " C_CYAN "%llu" C_RESET "\n",
-               (double)g_total_hashes / 1e9, (unsigned long long)g_stratum.shares_sent);
+        printf(C_CLR_LINE "Uptime: " C_CYAN "%s" C_RESET "  Connected: " C_GREEN "%s" C_RESET "  Hashes: " C_WHITE "%.2f B" C_RESET "\n",
+               uptime_str, conn_uptime, (double)g_total_hashes / 1e9);
     } else {
         printf(C_CLR_LINE "Uptime: " C_CYAN "%s" C_RESET "  Total hashes: " C_WHITE "%.2f B" C_RESET "\n",
                uptime_str, (double)g_total_hashes / 1e9);
@@ -1631,19 +1643,15 @@ static void draw_static_display(void)
 
     printf(C_CLR_LINE "================================================================================\n");
 
-    /* Log buffer - show recent events */
+    /* Log buffer - show recent events (blocks and network only) */
     printf(C_CLR_LINE C_BOLD "Recent:" C_RESET "\n");
     for (int i = 0; i < LOG_BUFFER_SIZE; i++) {
         int idx = (g_log_head - g_log_count + i + LOG_BUFFER_SIZE) % LOG_BUFFER_SIZE;
         if (i < g_log_count) {
-            if (strstr(g_log_buffer[idx], "BLOCK!") || strstr(g_log_buffer[idx], "ACCEPTED")) {
+            if (strstr(g_log_buffer[idx], "BLOCK!")) {
                 printf(C_CLR_LINE C_GREEN " %s" C_RESET "\n", g_log_buffer[idx]);
             } else if (strstr(g_log_buffer[idx], "NETWORK") || strstr(g_log_buffer[idx], "Connected")) {
                 printf(C_CLR_LINE C_CYAN " %s" C_RESET "\n", g_log_buffer[idx]);
-            } else if (strstr(g_log_buffer[idx], "REJECTED")) {
-                printf(C_CLR_LINE C_RED " %s" C_RESET "\n", g_log_buffer[idx]);
-            } else if (strstr(g_log_buffer[idx], "STALE")) {
-                printf(C_CLR_LINE C_YELLOW " %s" C_RESET "\n", g_log_buffer[idx]);
             } else {
                 printf(C_CLR_LINE " %s\n", g_log_buffer[idx]);
             }
@@ -2131,10 +2139,6 @@ int main(int argc, char* argv[])
 
                     /* Submit share to pool */
                     stratum_submit_share(&g_stratum, result.nonce, g_stratum.ntime);
-
-                    char ts[16];
-                    get_timestamp(ts, sizeof(ts));
-                    log_to_buffer("[%s] Share submitted: %s", ts, hash_str);
 
                     g_blocks_accepted = g_stratum.shares_accepted;
 
