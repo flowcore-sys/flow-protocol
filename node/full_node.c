@@ -669,13 +669,6 @@ bool ftc_node_validate_tx(ftc_node_t* node, const ftc_tx_t* tx)
         return false;  /* Can't create money */
     }
 
-    /* Verify signatures (disabled until Ed25519 is fixed) */
-    /* for (uint32_t i = 0; i < tx->input_count; i++) {
-        if (!ftc_tx_verify_input(tx, i)) {
-            return false;
-        }
-    } */
-
     return true;
 }
 

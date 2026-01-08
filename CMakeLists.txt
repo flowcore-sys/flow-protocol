@@ -46,6 +46,7 @@ include_directories(${CMAKE_SOURCE_DIR}/src)
 # Core library sources
 set(FTC_CORE_SOURCES
     src/crypto/keccak256.c
+    src/crypto/tweetnacl.c
     src/crypto/ed25519.c
     src/crypto/keys.c
     src/crypto/merkle.c
@@ -129,12 +130,18 @@ endif()
 
 # CUDA Support (NVIDIA)
 if(FTC_BUILD_CUDA)
-    # Set default CUDA architectures to suppress CMP0104 warning
-    set(CMAKE_CUDA_ARCHITECTURES "75;86;89" CACHE STRING "CUDA architectures")
+    # CMP0104: CMAKE_CUDA_ARCHITECTURES must be set
+    cmake_policy(SET CMP0104 NEW)
+
+    # Set CUDA architectures BEFORE enable_language(CUDA)
+    # 75=RTX20xx, 86=RTX30xx, 89=RTX40xx, 100=RTX50xx (Blackwell)
+    set(CMAKE_CUDA_ARCHITECTURES 75 86 89 100 CACHE STRING "CUDA architectures")
+
     enable_language(CUDA)
     find_package(CUDAToolkit REQUIRED)
 
     message(STATUS "CUDA found - building NVIDIA GPU miner")
+    message(STATUS "CUDA architectures: ${CMAKE_CUDA_ARCHITECTURES}")
 
     set(FTC_CUDA_SOURCES
         src/miner/keccak256_cuda.cu
@@ -146,23 +153,22 @@ if(FTC_BUILD_CUDA)
 
     target_include_directories(ftc-cuda PRIVATE ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/src)
     target_link_libraries(ftc-cuda CUDA::cudart)
-    set_target_properties(ftc-cuda PROPERTIES CUDA_SEPARABLE_COMPILATION OFF)
-
-    # Set CUDA architectures: 75=RTX20, 86=RTX30, 89=RTX40/50
-    set_target_properties(ftc-cuda PROPERTIES CUDA_ARCHITECTURES "75;86;89")
+    set_target_properties(ftc-cuda PROPERTIES
+        CUDA_SEPARABLE_COMPILATION OFF
+        CUDA_STANDARD 17
+    )
 
     # Platform-specific CUDA flags
     if(WIN32)
         # Fix CUDA 13.x nvcc issues with MSVC flags
         set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Xcompiler=/wd4996")
         set(CMAKE_CUDA_FLAGS_RELEASE "-O3")
-        # Remove all compile definitions from CUDA target to fix nvcc quoting issue with CMAKE_INTDIR
+        # Remove all compile definitions from CUDA target to fix nvcc quoting issue
         set_property(TARGET ftc-cuda PROPERTY COMPILE_DEFINITIONS "")
         set_property(SOURCE src/miner/keccak256_cuda.cu PROPERTY COMPILE_DEFINITIONS "")
     else()
-        # Linux: minimal flags, avoid passing gcc flags to nvcc
+        # Linux: minimal flags
         set(CMAKE_CUDA_FLAGS "-O3")
-        set_target_properties(ftc-cuda PROPERTIES CUDA_STANDARD 17)
     endif()
 endif()
 

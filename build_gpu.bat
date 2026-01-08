@@ -4,8 +4,8 @@ cd /d "c:\Flow Protocol"
 
 echo Compiling CUDA kernel (multi-GPU support)...
 REM Generate code for supported GPU architectures (CUDA 13.1+):
-REM sm_75=Turing(RTX2000), sm_86=Ampere(RTX3000), sm_89=Ada(RTX4000/5000)
-nvcc -c -O3 -use_fast_math -gencode=arch=compute_75,code=sm_75 -gencode=arch=compute_86,code=sm_86 -gencode=arch=compute_89,code=sm_89 -gencode=arch=compute_89,code=compute_89 -I include -I src -o build-gpu/keccak256_cuda.obj src/miner/keccak256_cuda.cu
+REM sm_75=Turing(RTX2000), sm_86=Ampere(RTX3000), sm_89=Ada(RTX4000), sm_100=Blackwell(RTX5000)
+nvcc -c -O3 -use_fast_math -gencode=arch=compute_75,code=sm_75 -gencode=arch=compute_86,code=sm_86 -gencode=arch=compute_89,code=sm_89 -gencode=arch=compute_100,code=sm_100 -gencode=arch=compute_100,code=compute_100 -I include -I src -o build-gpu/keccak256_cuda.obj src/miner/keccak256_cuda.cu
 if errorlevel 1 goto error
 
 echo Compiling gpu_miner.c...

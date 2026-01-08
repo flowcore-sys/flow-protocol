@@ -880,8 +880,10 @@ static void rpc_sendrawtransaction(ftc_rpc_server_t* rpc, ftc_json_t* json, cons
 
 static void rpc_sendtoaddress(ftc_rpc_server_t* rpc, ftc_json_t* json, const char* params, const char* id)
 {
-    /* Parse params: ["privkey_hex", "to_address", amount, fee (optional)] */
+    /* Parse params: ["privkey_hex", "pubkey_hex", "to_address", amount, fee (optional)] */
+    /* pubkey_hex can be provided to use legacy keys instead of deriving from privkey */
     char privkey_hex[128] = {0};
+    char pubkey_hex[128] = {0};
     char to_addr_str[64] = {0};
     double amount_ftc = 0;
     double fee_ftc = 0.0001;  /* Default fee: 0.0001 FTC */
@@ -901,6 +903,24 @@ static void rpc_sendtoaddress(ftc_rpc_server_t* rpc, ftc_json_t* json, const cha
 
     if (strlen(privkey_hex) != 64) {
         rpc_error(json, -1, "Invalid private key (must be 64 hex chars)", id);
+        return;
+    }
+
+    /* Parse public key hex */
+    p = strchr(p + 1, '"');
+    if (!p) {
+        rpc_error(json, -1, "Missing public key", id);
+        return;
+    }
+    p++;
+    i = 0;
+    while (*p && *p != '"' && i < sizeof(pubkey_hex) - 1) {
+        pubkey_hex[i++] = *p++;
+    }
+    pubkey_hex[i] = '\0';
+
+    if (strlen(pubkey_hex) != 64) {
+        rpc_error(json, -1, "Invalid public key (must be 64 hex chars)", id);
         return;
     }
 
@@ -954,10 +974,14 @@ static void rpc_sendtoaddress(ftc_rpc_server_t* rpc, ftc_json_t* json, const cha
         privkey[j] = (uint8_t)byte;
     }
 
-    /* Derive public key and address */
+    /* Use provided public key directly (for legacy key support) */
     ftc_pubkey_t pubkey;
     ftc_address_t from_addr;
-    ftc_pubkey_from_privkey(privkey, pubkey);
+    for (int j = 0; j < 32; j++) {
+        unsigned int byte;
+        sscanf(pubkey_hex + j * 2, "%02x", &byte);
+        pubkey[j] = (uint8_t)byte;
+    }
     ftc_address_from_pubkey(pubkey, from_addr);
 
     /* Decode destination address */

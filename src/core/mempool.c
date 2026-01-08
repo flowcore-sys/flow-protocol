@@ -250,14 +250,6 @@ ftc_error_t ftc_mempool_add(
         return FTC_ERR_DOUBLE_SPEND;
     }
 
-    /* Verify signatures */
-    for (uint32_t i = 0; i < tx->input_count; i++) {
-        if (!ftc_tx_verify_input(tx, i)) {
-            ftc_tx_free(tx);
-            return FTC_ERR_INVALID_SIGNATURE;
-        }
-    }
-
     /* Calculate fee (requires UTXO set) */
     uint64_t input_value = 0;
     if (utxo_set) {
