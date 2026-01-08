@@ -252,6 +252,7 @@ static void print_help(void)
     printf("  -testnet           Use testnet\n");
     printf("  -bootstrap <url>   Download blocks.dat from node URL\n");
     printf("  -nowallet          Disable wallet\n");
+    printf("  -recover           Recovery mode: skip validation when loading blocks\n");
     printf("  -help              Show this help\n");
     printf("\n");
     printf("Example:\n");
@@ -287,6 +288,10 @@ int main(int argc, char* argv[])
         }
         else if (strcmp(argv[i], "-nowallet") == 0) {
             config.wallet_enabled = false;
+        }
+        else if (strcmp(argv[i], "-recover") == 0) {
+            config.recovery_mode = true;
+            printf("*** RECOVERY MODE: Loading blocks without validation ***\n");
         }
         else {
             printf("Unknown option: %s\n", argv[i]);

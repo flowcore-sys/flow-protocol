@@ -265,15 +265,79 @@ static int ftc_chain_load(ftc_node_t* node, const char* path)
             break;
         }
 
-        /* Add block to chain (validates and updates UTXO) */
-        if (ftc_chain_add_block(node, block)) {
-            loaded++;
+        /* Add block to chain */
+        bool skip_validation = node->config.recovery_mode || (i <= FTC_CHECKPOINT_HEIGHT);
+        if (skip_validation) {
+            /* Checkpoint/recovery mode: add blocks directly without prev_hash validation */
+            ftc_chain_t* chain = node->chain;
+
+            /* Expand if needed */
+            if (chain->block_count >= chain->block_capacity) {
+                int new_cap = chain->block_capacity * 2;
+                ftc_block_t** new_blocks = (ftc_block_t**)realloc(chain->blocks, new_cap * sizeof(ftc_block_t*));
+                if (new_blocks) {
+                    chain->blocks = new_blocks;
+                    chain->block_capacity = new_cap;
+                }
+            }
+
+            /* Clone block for storage */
+            size_t block_size = ftc_block_serialize(block, NULL, 0);
+            uint8_t* block_data_copy = (uint8_t*)malloc(block_size);
+            if (block_data_copy) {
+                ftc_block_serialize(block, block_data_copy, block_size);
+                ftc_block_t* block_copy = ftc_block_deserialize(block_data_copy, block_size);
+                free(block_data_copy);
+
+                if (block_copy) {
+                    ftc_hash256_t block_hash;
+                    ftc_block_hash(block, block_hash);
+
+                    chain->blocks[chain->block_count++] = block_copy;
+                    chain->best_height++;
+                    memcpy(chain->best_hash, block_hash, 32);
+                    hash_index_add(chain, block_hash, chain->block_count - 1);
+
+                    /* Update UTXO set */
+                    for (uint32_t t = 0; t < block->tx_count; t++) {
+                        ftc_tx_t* tx = block->txs[t];
+                        ftc_hash256_t txid;
+                        ftc_tx_hash(tx, txid);
+
+                        /* Remove spent UTXOs */
+                        if (!ftc_tx_is_coinbase(tx)) {
+                            for (uint32_t j = 0; j < tx->input_count; j++) {
+                                ftc_utxo_t* spent = ftc_utxo_set_remove(node->utxo_set, tx->inputs[j].prev_txid, tx->inputs[j].vout);
+                                if (spent) ftc_utxo_free(spent);
+                            }
+                        }
+
+                        /* Add new UTXOs */
+                        for (uint32_t j = 0; j < tx->output_count; j++) {
+                            ftc_utxo_t utxo;
+                            memcpy(utxo.txid, txid, 32);
+                            utxo.vout = j;
+                            utxo.value = tx->outputs[j].value;
+                            memcpy(utxo.pubkey_hash, tx->outputs[j].pubkey_hash, 20);
+                            utxo.height = chain->best_height;
+                            utxo.spent = false;
+                            ftc_utxo_set_add(node->utxo_set, &utxo);
+                        }
+                    }
+                    loaded++;
+                }
+            }
         } else {
-            ftc_hash256_t hash;
-            ftc_block_hash(block, hash);
-            char hex[65];
-            ftc_hash_to_hex(hash, hex);
-            printf("[NODE] Block %u rejected: %s\n", i, hex);
+            /* Normal mode: full validation */
+            if (ftc_chain_add_block(node, block)) {
+                loaded++;
+            } else {
+                ftc_hash256_t hash;
+                ftc_block_hash(block, hash);
+                char hex[65];
+                ftc_hash_to_hex(hash, hex);
+                printf("[NODE] Block %u rejected: %s\n", i, hex);
+            }
         }
 
         ftc_block_free(block);
@@ -282,7 +346,19 @@ static int ftc_chain_load(ftc_node_t* node, const char* path)
     fclose(f);
 
     /* Remember how many blocks were in the file to prevent data loss */
-    node->chain->loaded_block_count = count;
+    bool used_checkpoint = (loaded > 0 && count > 2014);  /* Used checkpoint loading */
+    if ((node->config.recovery_mode || used_checkpoint) && loaded > 0) {
+        /* In recovery/checkpoint mode, update loaded_block_count to actual loaded count
+           to allow saving the blockchain */
+        node->chain->loaded_block_count = loaded + 1;  /* +1 for genesis */
+        if (node->config.recovery_mode) {
+            printf("[NODE] RECOVERY: Loaded %d blocks (was %u in file)\n", loaded, count);
+        } else if (used_checkpoint) {
+            printf("[NODE] Loaded %d blocks using checkpoint\n", loaded);
+        }
+    } else {
+        node->chain->loaded_block_count = count;
+    }
 
     return loaded;
 }
@@ -944,6 +1020,18 @@ bool ftc_node_start(ftc_node_t* node)
     char blocks_path[512];
     snprintf(blocks_path, sizeof(blocks_path), "%s/blocks.dat", node->config.data_dir);
     ftc_chain_load(node, blocks_path);
+
+    /* In recovery/checkpoint mode, force save if we loaded more than 2014 blocks */
+    bool should_save = node->config.recovery_mode ||
+                       (node->chain->block_count > 2015);  /* Used checkpoint loading */
+    if (should_save && node->chain->block_count > 1) {
+        printf("[NODE] Saving blockchain (%d blocks)...\n", node->chain->block_count);
+        if (ftc_chain_save(node->chain, blocks_path)) {
+            printf("[NODE] Blockchain saved successfully!\n");
+        } else {
+            printf("[NODE] WARNING - Failed to save blockchain!\n");
+        }
+    }
 
     /* Initialize auto-save state */
     node->last_save_height = node->chain->best_height;

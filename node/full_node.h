@@ -69,7 +69,13 @@ typedef struct {
     /* Logging */
     int             log_level;
 
+    /* Recovery mode - skip prev_hash validation when loading */
+    bool            recovery_mode;
+
 } ftc_node_config_t;
+
+/* Checkpoint - trust blockchain up to this height (skip prev_hash validation during load) */
+#define FTC_CHECKPOINT_HEIGHT 28423
 
 /*==============================================================================
  * BLOCKCHAIN STATE
