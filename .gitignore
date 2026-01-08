@@ -45,3 +45,10 @@ peers.dat
 # OS
 .DS_Store
 Thumbs.db
+
+# Dev only
+node/
+pool-server/
+build-linux/
+deploy/
+logo/
