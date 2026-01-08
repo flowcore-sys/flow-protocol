@@ -2,7 +2,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Build Status](https://img.shields.io/badge/build-passing-brightgreen.svg)]()
-[![Version](https://img.shields.io/badge/version-2.0.0-blue.svg)]()
+[![Version](https://img.shields.io/badge/version-2.1.0-blue.svg)]()
 [![Network](https://img.shields.io/badge/network-mainnet-green.svg)]()
 [![Telegram](https://img.shields.io/badge/Telegram-Join%20Chat-blue.svg?logo=telegram)](https://t.me/flow_protocol_main)
 
@@ -39,62 +39,55 @@ Flow Token Chain (FTC) brings GPU mining back to cryptocurrency. Built on the **
 | **Algorithm** | Keccak-256 (double hash) |
 | **Consensus** | Proof of Work |
 | **Model** | UTXO (Bitcoin-style) |
-| **Database** | LevelDB |
 | **Max Supply** | 21,000,000 FTC |
 | **Decimals** | 8 |
 | **Block Time** | 60 seconds |
 | **Initial Reward** | 50 FTC |
 | **Halving** | Every 210,000 blocks (~4 years) |
-| **P2P Port** | 17317 |
 | **RPC Port** | 17318 |
+
+---
+
+## Network Infrastructure
+
+FTC runs on a **high-availability centralized server** with **AWS Global Accelerator** for ultra-low latency worldwide.
+
+### Global Low-Latency Network
+
+- **Anycast routing** — Connect to the same DNS, get routed to your nearest AWS edge location
+- **~3-5ms latency** — From most locations worldwide
+- **Auto-recovery** — Server automatically restarts on crashes
+- **Real-time saves** — Every block is saved immediately, no data loss
+- **Dynamic difficulty** — Adjusts every 2016 blocks based on network hashrate
+
+### DNS Seeds
+
+The miner automatically discovers the server via DNS:
+- `seed.flowprotocol.net`
+- `seed1.flowprotocol.net`
 
 ---
 
 ## Quick Start
 
-Get mining in 5 minutes:
+Get mining in 2 minutes:
 
 ### Prerequisites
 
 - NVIDIA GPU (RTX 30/40/50 series)
-- [CUDA Toolkit 12.0+](https://developer.nvidia.com/cuda-downloads)
-- CMake 3.16+
-- C compiler (GCC, Clang, or MSVC)
+- Windows 10/11 or Linux
 
-### 1. Clone the repository
+### 1. Download
 
-```bash
-git clone https://github.com/flowcore-sys/flow-protocol.git
-cd flow-protocol
-```
+Get the latest release from [GitHub Releases](https://github.com/flowcore-sys/flow-protocol/releases)
 
-### 2. Build
+### 2. Start Mining
 
 ```bash
-mkdir build && cd build
-cmake -DFTC_BUILD_CUDA=ON ..
-cmake --build . --config Release
+ftc-miner-gpu -address YOUR_ADDRESS
 ```
 
-### 3. Generate a wallet address
-
-```bash
-./ftc-genaddr
-```
-
-Save your private key securely! You'll see output like:
-```
-Address: 1A2B3C4D5E6F...
-Private Key: abc123def456...
-```
-
-### 4. Start mining
-
-```bash
-./ftc-miner-gpu -address YOUR_ADDRESS_HERE
-```
-
-That's it! The miner will automatically discover peers via DNS and start mining.
+That's it! The miner will automatically connect to the optimal server endpoint.
 
 ---
 
@@ -125,7 +118,7 @@ Real-world hashrates measured on mainnet:
 ```bash
 # Install dependencies
 sudo apt update
-sudo apt install -y build-essential cmake git libleveldb-dev
+sudo apt install -y build-essential cmake git
 
 # Install CUDA Toolkit (for GPU mining)
 # Download from: https://developer.nvidia.com/cuda-downloads
@@ -134,10 +127,6 @@ sudo apt install -y build-essential cmake git libleveldb-dev
 git clone https://github.com/flowcore-sys/flow-protocol.git
 cd flow-protocol
 mkdir build && cd build
-
-# CPU-only build
-cmake ..
-make -j$(nproc)
 
 # GPU build (requires CUDA)
 cmake -DFTC_BUILD_CUDA=ON ..
@@ -156,27 +145,10 @@ make -j$(nproc)
 git clone https://github.com/flowcore-sys/flow-protocol.git
 cd flow-protocol
 
-# Build with CMake
-mkdir build
-cd build
-cmake -G "Visual Studio 17 2022" -A x64 -DFTC_BUILD_CUDA=ON ..
-cmake --build . --config Release
+# Build with batch script
+build_gpu.bat
 
-# Binaries will be in build/Release/
-```
-
-### macOS
-
-```bash
-# Install dependencies
-brew install cmake leveldb
-
-# Clone and build (CPU only, no CUDA on macOS)
-git clone https://github.com/flowcore-sys/flow-protocol.git
-cd flow-protocol
-mkdir build && cd build
-cmake ..
-make -j$(sysctl -n hw.ncpu)
+# Binary will be in release/
 ```
 
 ### CMake Options
@@ -185,94 +157,58 @@ make -j$(sysctl -n hw.ncpu)
 |--------|---------|-------------|
 | `FTC_BUILD_CUDA` | OFF | Enable CUDA GPU mining support |
 | `FTC_BUILD_TESTS` | ON | Build unit tests |
-| `FTC_BUILD_TOOLS` | ON | Build utility tools |
 
 ---
 
-## Running a Node
+## Miner Options
 
-> **Detailed Guide:** See [docs/NODE_SETUP.md](docs/NODE_SETUP.md) for complete node setup instructions, including systemd service, cloud deployment, and becoming a seed node.
-
-### Start a Full Node
-
-```bash
-./ftc-node -datadir /path/to/data
 ```
-
-The node will:
-- Automatically discover peers via DNS (flowprotocol.net)
-- Sync the blockchain
-- Start RPC server on port 17318
-- Accept P2P connections on port 17317
-
-### Configuration Options
-
-```bash
-./ftc-node [options]
+ftc-miner-gpu [options]
 
 Options:
-  -datadir <path>     Data directory for blockchain storage
-  -rpcport <port>     RPC port (default: 17318)
-  -port <port>        P2P port (default: 17317)
-  -seed <host>        Add seed node manually
-  -bootstrap <url>    Download blocks.dat from existing node
-  -nowallet           Disable wallet functionality
+  -address <addr>     Mining reward address (required)
+  -node <host>        Manual node address (optional, auto-discovered via DNS)
+  -devices <ids>      GPU device IDs to use, comma-separated (default: all)
 ```
 
-### Fast Node Sync (Bootstrap)
-
-New nodes can quickly sync by downloading the blockchain from an existing node:
+### Examples
 
 ```bash
-# Download blocks.dat from a seed node and start
-./ftc-node -bootstrap http://seed.flowprotocol.net:17318
+# Basic mining (auto-discovers best server)
+ftc-miner-gpu -address 1YourAddressHere
+
+# Specify server manually
+ftc-miner-gpu -address 1YourAddressHere -node seed.flowprotocol.net
+
+# Use specific GPUs (0 and 1)
+ftc-miner-gpu -address 1YourAddressHere -devices 0,1
 ```
-
-This downloads the complete `blocks.dat` file (~2MB per 1000 blocks) instead of syncing block-by-block over P2P, reducing initial sync time from hours to minutes.
-
-If `blocks.dat` already exists, the bootstrap is skipped automatically.
-
-### Port Forwarding
-
-To help the network, open these ports on your router:
-
-| Port | Protocol | Purpose |
-|------|----------|---------|
-| 17317 | TCP | P2P connections |
-| 17318 | TCP | RPC API (optional) |
 
 ---
 
 ## RPC API
 
-FTC provides a JSON-RPC API compatible with standard cryptocurrency infrastructure.
+FTC provides a JSON-RPC API for querying the blockchain.
 
-### Basic Usage
+### Endpoint
 
-```bash
-curl -X POST http://localhost:17318 \
-  -H "Content-Type: application/json" \
-  -d '{"jsonrpc":"2.0","method":"getinfo","params":[],"id":1}'
+```
+https://seed.flowprotocol.net:17318
 ```
 
 ### Key Methods
 
 | Method | Description |
 |--------|-------------|
-| `getinfo` | Get node status (blocks, peers, version) |
+| `getinfo` | Get node status (blocks, version) |
 | `getblockcount` | Get current block height |
 | `getbestblockhash` | Get latest block hash |
 | `getdifficulty` | Get current mining difficulty |
-| `getpeercount` | Get connected peer count |
 | `getbalance` | Get address balance |
 | `getblock` | Get block by hash or height |
 | `gettransaction` | Get transaction details |
 | `listunspent` | List UTXOs for address |
-| `sendtoaddress` | Send FTC to address |
 | `sendrawtransaction` | Broadcast signed transaction |
-| `getblocktemplate` | Get mining template |
-| `submitblock` | Submit mined block |
-| `getblocksinfo` | Get blocks.dat file info for sync |
 
 ### Example: Check Balance
 
@@ -287,58 +223,13 @@ Response:
 {"jsonrpc":"2.0","result":1234.56789012,"id":"1"}
 ```
 
-### Example: Get Blocks Info (for sync)
+### Example: Get Block Height
 
 ```bash
 curl -X POST http://seed.flowprotocol.net:17318 \
   -H "Content-Type: application/json" \
-  -d '{"jsonrpc":"2.0","method":"getblocksinfo","params":[],"id":1}'
+  -d '{"jsonrpc":"2.0","method":"getblockcount","params":[],"id":1}'
 ```
-
-Response:
-```json
-{"jsonrpc":"2.0","result":{"blocks":7500,"size":1912512,"available":true,"url":"/blocks.dat"},"id":"1"}
-```
-
-### Download Blockchain File
-
-Nodes expose `blocks.dat` via HTTP for fast sync:
-
-```bash
-# Download blocks.dat directly
-curl -o blocks.dat http://seed.flowprotocol.net:17318/blocks.dat
-
-# Or use bootstrap flag (recommended)
-./ftc-node -bootstrap http://seed.flowprotocol.net:17318
-```
-
----
-
-## Network
-
-### DNS Discovery
-
-FTC uses DNS-based peer discovery. The miner and node automatically find peers through:
-
-- `seed.flowprotocol.net`
-- `seed1.flowprotocol.net`
-- `seed2.flowprotocol.net`
-
-### Manual Connection
-
-To connect to a specific node:
-
-```bash
-./ftc-node -seed 52.78.138.240
-./ftc-miner-gpu -node 52.78.138.240 -address YOUR_ADDRESS
-```
-
-### Network Status
-
-- **Mainnet Status:** Live
-- **Active Peers:** 35+
-- **Block Height:** Growing
-- **Network Hashrate:** Varies with miners
 
 ---
 
@@ -364,19 +255,6 @@ curl -s -X POST http://seed.flowprotocol.net:17318 \
   -d '{"jsonrpc":"2.0","method":"getbalance","params":["YOUR_ADDRESS"],"id":1}'
 ```
 
-### Send Transaction
-
-```bash
-curl -X POST http://localhost:17318 \
-  -H "Content-Type: application/json" \
-  -d '{
-    "jsonrpc":"2.0",
-    "method":"sendtoaddress",
-    "params":["PRIVATE_KEY_HEX","RECIPIENT_ADDRESS",AMOUNT,FEE],
-    "id":1
-  }'
-```
-
 ---
 
 ## Roadmap
@@ -389,8 +267,8 @@ curl -X POST http://localhost:17318 \
 - [x] RPC API for exchanges
 - [x] UTXO model
 - [x] Difficulty adjustment
-- [x] Transaction validation
-- [x] Fast node sync (blocks.dat bootstrap)
+- [x] Global low-latency infrastructure (AWS Global Accelerator)
+- [x] Auto-recovery and real-time saves
 
 ### In Progress
 
@@ -404,33 +282,6 @@ curl -X POST http://localhost:17318 \
 - [ ] Exchange listings
 - [ ] Mobile wallet
 - [ ] AI compute marketplace integration
-- [ ] Smart contract layer (future)
-
----
-
-## Contributing
-
-We welcome contributions! Here's how to help:
-
-1. **Fork** the repository
-2. **Create** a feature branch (`git checkout -b feature/amazing-feature`)
-3. **Commit** your changes (`git commit -m 'Add amazing feature'`)
-4. **Push** to the branch (`git push origin feature/amazing-feature`)
-5. **Open** a Pull Request
-
-### Development Guidelines
-
-- Follow existing code style
-- Add tests for new features
-- Update documentation
-- Keep commits atomic and well-described
-
-### Priority Areas
-
-- Performance optimizations
-- Additional GPU support (AMD/Intel)
-- Network protocol improvements
-- Documentation and guides
 
 ---
 
@@ -452,13 +303,6 @@ Found a bug? Please [open an issue](https://github.com/flowcore-sys/flow-protoco
 - Steps to reproduce
 - System information (OS, GPU, driver version)
 - Relevant logs
-
-### Feature Requests
-
-Have an idea? Open an issue with the `enhancement` label describing:
-- The feature you'd like
-- Why it would be useful
-- Possible implementation approach
 
 ---
 
