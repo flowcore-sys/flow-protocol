@@ -185,7 +185,7 @@ void keccak256_32(__private const uchar* data, __private uchar* hash)
  *============================================================================*/
 
 __kernel void keccak256_mine(
-    __global const uchar* header,       /* 80-byte header (nonce at 76-79) */
+    __global const ulong* header64,     /* 80-byte header as 10 ulong (nonce at bytes 76-79) */
     __global const uchar* target,       /* 32-byte target */
     const uint nonce_start,
     __global uint* result_nonce,
@@ -196,23 +196,26 @@ __kernel void keccak256_mine(
     uint gid = get_global_id(0);
     uint nonce = nonce_start + gid;
 
-    /* Copy header to private memory and set nonce */
-    uchar local_header[80];
+    /* Load header using 64-bit operations for alignment (like CUDA) */
+    ulong local_header_u64[10];
     #pragma unroll
-    for (int i = 0; i < 76; i++) {
-        local_header[i] = header[i];
+    for (int i = 0; i < 9; i++) {
+        local_header_u64[i] = header64[i];
     }
-    local_header[76] = (uchar)(nonce);
-    local_header[77] = (uchar)(nonce >> 8);
-    local_header[78] = (uchar)(nonce >> 16);
-    local_header[79] = (uchar)(nonce >> 24);
 
-    /* Double Keccak-256 */
-    uchar hash1[32], hash2[32];
-    keccak256_80(local_header, hash1);
-    keccak256_32(hash1, hash2);
+    /* Set nonce in last 64-bit word (bytes 72-79, nonce is at 76-79) */
+    /* header64[9] contains bytes 72-79, we need to replace bytes 76-79 with nonce */
+    ulong last_word = header64[9];
+    last_word = (last_word & 0x00000000FFFFFFFFUL) | ((ulong)nonce << 32);
+    local_header_u64[9] = last_word;
 
-    /* Compare with target (big-endian comparison) */
+    /* Double Keccak-256 - use aligned arrays for correct ulong casts */
+    ulong hash1_u64[4], hash2_u64[4];
+    keccak256_80((__private uchar*)local_header_u64, (__private uchar*)hash1_u64);
+    keccak256_32((__private uchar*)hash1_u64, (__private uchar*)hash2_u64);
+    __private uchar* hash2 = (__private uchar*)hash2_u64;
+
+    /* Compare with target (big-endian comparison from MSB) */
     bool valid = true;
     #pragma unroll
     for (int i = 31; i >= 0; i--) {
