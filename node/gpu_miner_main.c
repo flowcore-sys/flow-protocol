@@ -744,9 +744,105 @@ static void submit_block_async(int node_idx, ftc_block_t* block)
 
 static bool submit_block(int node_idx, ftc_block_t* block)
 {
-    /* Use async version for speed, assume accepted */
-    submit_block_async(node_idx, block);
-    return true;  /* Optimistically assume accepted */
+    if (node_idx < 0 || node_idx >= g_node_count) return false;
+
+    node_info_t* node = &g_nodes[node_idx];
+
+    size_t size = ftc_block_serialize(block, NULL, 0);
+    uint8_t* data = (uint8_t*)malloc(size);
+    if (!data) return false;
+
+    ftc_block_serialize(block, data, size);
+
+    char* hex = (char*)malloc(size * 2 + 1);
+    if (!hex) {
+        free(data);
+        return false;
+    }
+
+    for (size_t i = 0; i < size; i++) {
+        sprintf(hex + i * 2, "%02x", data[i]);
+    }
+    free(data);
+
+    /* Build JSON-RPC request */
+    char* request = (char*)malloc(size * 2 + 256);
+    if (!request) {
+        free(hex);
+        return false;
+    }
+
+    int req_len = sprintf(request,
+        "{\"jsonrpc\":\"2.0\",\"method\":\"submitblock\",\"params\":[\"%s\"],\"id\":1}",
+        hex);
+    free(hex);
+
+    /* Open socket */
+    miner_socket_t sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (sock == MINER_INVALID_SOCKET) {
+        free(request);
+        return false;
+    }
+
+    /* Set timeouts - need to wait for response */
+#ifdef _WIN32
+    DWORD timeout = 5000;  /* 5 seconds */
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, (char*)&timeout, sizeof(timeout));
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (char*)&timeout, sizeof(timeout));
+#else
+    struct timeval tv = {5, 0};  /* 5 seconds */
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+#endif
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    inet_pton(AF_INET, node->ip, &addr.sin_addr);
+    addr.sin_port = htons(node->port);
+
+    bool accepted = false;
+
+    if (connect(sock, (struct sockaddr*)&addr, sizeof(addr)) == 0) {
+        char http[256];
+        int http_len = sprintf(http,
+            "POST / HTTP/1.1\r\n"
+            "Host: %s:%d\r\n"
+            "Content-Type: application/json\r\n"
+            "Content-Length: %d\r\n"
+            "Connection: close\r\n\r\n",
+            node->ip, node->port, req_len);
+
+        send(sock, http, http_len, 0);
+        send(sock, request, req_len, 0);
+
+        /* Wait for response and check if accepted */
+        char response[4096];
+        int total = 0;
+        while (total < (int)sizeof(response) - 1) {
+            int n = recv(sock, response + total, sizeof(response) - 1 - total, 0);
+            if (n <= 0) break;
+            total += n;
+        }
+        response[total] = '\0';
+
+        /* Check response - accepted if "result":null (no error) */
+        if (total > 0) {
+            /* Block accepted if response contains "result":null and no "error" field with message */
+            if (strstr(response, "\"result\":null") != NULL &&
+                strstr(response, "\"error\":{") == NULL) {
+                accepted = true;
+            }
+        }
+    }
+
+#ifdef _WIN32
+    closesocket(sock);
+#else
+    close(sock);
+#endif
+    free(request);
+    return accepted;
 }
 
 /*==============================================================================
