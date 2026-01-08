@@ -894,6 +894,8 @@ static void draw_static_display(void)
         if (i < g_log_count) {
             if (strstr(g_log_buffer[idx], "BLOCK!")) {
                 printf(C_CLR_LINE C_GREEN " %s" C_RESET "\n", g_log_buffer[idx]);
+            } else if (strstr(g_log_buffer[idx], "NETWORK")) {
+                printf(C_CLR_LINE C_CYAN " %s" C_RESET "\n", g_log_buffer[idx]);
             } else if (strstr(g_log_buffer[idx], "REJECTED")) {
                 printf(C_CLR_LINE C_RED " %s" C_RESET "\n", g_log_buffer[idx]);
             } else {
@@ -1303,7 +1305,13 @@ int main(int argc, char* argv[])
             /* Check for new block from network every 5 seconds */
             if (now - last_block_check >= 5000) {
                 if (get_node_info(g_active_node) && g_nodes[g_active_node].height > height) {
-                    break;  /* New block found by network */
+                    /* Log network block */
+                    char ts[16];
+                    get_timestamp(ts, sizeof(ts));
+                    log_to_buffer("[%s] NETWORK h=%u (new block from other miner)", ts, g_nodes[g_active_node].height);
+                    g_current_height = g_nodes[g_active_node].height;
+                    draw_static_display();
+                    break;
                 }
                 last_block_check = now;
             }
