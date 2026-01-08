@@ -134,8 +134,9 @@ if(FTC_BUILD_CUDA)
     cmake_policy(SET CMP0104 NEW)
 
     # Set CUDA architectures BEFORE enable_language(CUDA)
-    # 75=RTX20xx, 86=RTX30xx, 89=RTX40xx, 100=RTX5080, 110=RTX5090
-    set(CMAKE_CUDA_ARCHITECTURES 75 86 89 100 110 CACHE STRING "CUDA architectures")
+    # 75=RTX20xx, 86=RTX30xx, 89=RTX40xx, 100=RTX50xx (Blackwell, incl. 5090)
+    # Note: sm_100 is correct for ALL RTX 50 series including 5090
+    set(CMAKE_CUDA_ARCHITECTURES 75 86 89 100 CACHE STRING "CUDA architectures")
 
     enable_language(CUDA)
     find_package(CUDAToolkit REQUIRED)
