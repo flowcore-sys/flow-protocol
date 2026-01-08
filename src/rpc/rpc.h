@@ -35,6 +35,10 @@ extern "C" {
 #define FTC_RPC_MAX_REQUEST     (1024 * 1024)  /* 1MB */
 #define FTC_RPC_MAX_RESPONSE    (4 * 1024 * 1024)  /* 4MB */
 
+/* Miner tracking */
+#define FTC_MAX_MINERS          256
+#define FTC_MINER_TIMEOUT       300  /* 5 minutes - consider inactive after this */
+
 /*==============================================================================
  * RPC CONTEXT (passed to handlers)
  *============================================================================*/
@@ -78,8 +82,36 @@ typedef struct {
 } ftc_rpc_handlers_t;
 
 /*==============================================================================
+ * MINER TRACKING
+ *============================================================================*/
+
+typedef struct {
+    char        ip[64];           /* Miner IP address */
+    int64_t     first_seen;       /* Unix timestamp */
+    int64_t     last_seen;        /* Unix timestamp */
+    uint32_t    requests;         /* Total getblocktemplate requests */
+    uint32_t    blocks_found;     /* Blocks submitted and accepted */
+    uint32_t    blocks_rejected;  /* Blocks submitted but rejected */
+} ftc_miner_info_t;
+
+/*==============================================================================
  * RPC SERVER
  *============================================================================*/
+
+#ifdef _WIN32
+typedef CRITICAL_SECTION ftc_rpc_mutex_t;
+#define FTC_RPC_MUTEX_INIT(m) InitializeCriticalSection(&(m))
+#define FTC_RPC_MUTEX_DESTROY(m) DeleteCriticalSection(&(m))
+#define FTC_RPC_MUTEX_LOCK(m) EnterCriticalSection(&(m))
+#define FTC_RPC_MUTEX_UNLOCK(m) LeaveCriticalSection(&(m))
+#else
+#include <pthread.h>
+typedef pthread_mutex_t ftc_rpc_mutex_t;
+#define FTC_RPC_MUTEX_INIT(m) pthread_mutex_init(&(m), NULL)
+#define FTC_RPC_MUTEX_DESTROY(m) pthread_mutex_destroy(&(m))
+#define FTC_RPC_MUTEX_LOCK(m) pthread_mutex_lock(&(m))
+#define FTC_RPC_MUTEX_UNLOCK(m) pthread_mutex_unlock(&(m))
+#endif
 
 typedef struct {
     ftc_rpc_socket_t    listen_socket;
@@ -91,6 +123,11 @@ typedef struct {
     /* Connection tracking */
     ftc_rpc_socket_t    clients[FTC_RPC_MAX_CONNECTIONS];
     int                 client_count;
+
+    /* Miner tracking (protected by miner_mutex) */
+    ftc_miner_info_t    miners[FTC_MAX_MINERS];
+    int                 miner_count;
+    ftc_rpc_mutex_t     miner_mutex;
 
 } ftc_rpc_server_t;
 
@@ -127,6 +164,26 @@ void ftc_rpc_stop(ftc_rpc_server_t* rpc);
  * Process RPC requests (call periodically)
  */
 void ftc_rpc_poll(ftc_rpc_server_t* rpc, int timeout_ms);
+
+/**
+ * Track miner activity (called internally on getblocktemplate)
+ */
+void ftc_rpc_track_miner(ftc_rpc_server_t* rpc, const char* ip);
+
+/**
+ * Record block submission (called internally on submitblock)
+ */
+void ftc_rpc_record_block(ftc_rpc_server_t* rpc, const char* ip, bool accepted);
+
+/**
+ * Get number of active miners (seen in last FTC_MINER_TIMEOUT seconds)
+ */
+int ftc_rpc_get_active_miners(ftc_rpc_server_t* rpc);
+
+/**
+ * Get miner info array (for getminerstats RPC)
+ */
+const ftc_miner_info_t* ftc_rpc_get_miners(ftc_rpc_server_t* rpc, int* count);
 
 /*==============================================================================
  * JSON UTILITIES

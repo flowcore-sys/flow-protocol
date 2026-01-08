@@ -99,7 +99,6 @@ typedef int miner_socket_t;
 static const char* DNS_SEEDS[] = {
     "seed.flowprotocol.net",
     "seed1.flowprotocol.net",
-    "seed2.flowprotocol.net",
     NULL
 };
 

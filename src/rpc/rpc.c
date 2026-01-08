@@ -334,6 +334,9 @@ ftc_rpc_server_t* ftc_rpc_new(void)
         rpc->clients[i] = FTC_RPC_INVALID_SOCKET;
     }
 
+    /* Initialize miner tracking mutex */
+    FTC_RPC_MUTEX_INIT(rpc->miner_mutex);
+
     return rpc;
 }
 
@@ -341,6 +344,7 @@ void ftc_rpc_free(ftc_rpc_server_t* rpc)
 {
     if (!rpc) return;
     ftc_rpc_stop(rpc);
+    FTC_RPC_MUTEX_DESTROY(rpc->miner_mutex);
     free(rpc);
 }
 
@@ -415,6 +419,110 @@ void ftc_rpc_stop(ftc_rpc_server_t* rpc)
         }
     }
     rpc->client_count = 0;
+}
+
+/*==============================================================================
+ * MINER TRACKING
+ *============================================================================*/
+
+void ftc_rpc_track_miner(ftc_rpc_server_t* rpc, const char* ip)
+{
+    if (!rpc || !ip || !ip[0]) return;
+
+    int64_t now = (int64_t)time(NULL);
+
+    FTC_RPC_MUTEX_LOCK(rpc->miner_mutex);
+
+    /* Find existing miner */
+    for (int i = 0; i < rpc->miner_count; i++) {
+        if (strcmp(rpc->miners[i].ip, ip) == 0) {
+            rpc->miners[i].last_seen = now;
+            rpc->miners[i].requests++;
+            FTC_RPC_MUTEX_UNLOCK(rpc->miner_mutex);
+            return;
+        }
+    }
+
+    /* Add new miner if space available */
+    if (rpc->miner_count < FTC_MAX_MINERS) {
+        ftc_miner_info_t* miner = &rpc->miners[rpc->miner_count++];
+        strncpy(miner->ip, ip, sizeof(miner->ip) - 1);
+        miner->ip[sizeof(miner->ip) - 1] = '\0';
+        miner->first_seen = now;
+        miner->last_seen = now;
+        miner->requests = 1;
+        miner->blocks_found = 0;
+        miner->blocks_rejected = 0;
+    }
+
+    FTC_RPC_MUTEX_UNLOCK(rpc->miner_mutex);
+}
+
+void ftc_rpc_record_block(ftc_rpc_server_t* rpc, const char* ip, bool accepted)
+{
+    if (!rpc || !ip || !ip[0]) return;
+
+    int64_t now = (int64_t)time(NULL);
+
+    FTC_RPC_MUTEX_LOCK(rpc->miner_mutex);
+
+    /* Find existing miner */
+    for (int i = 0; i < rpc->miner_count; i++) {
+        if (strcmp(rpc->miners[i].ip, ip) == 0) {
+            if (accepted) {
+                rpc->miners[i].blocks_found++;
+            } else {
+                rpc->miners[i].blocks_rejected++;
+            }
+            rpc->miners[i].last_seen = now;
+            FTC_RPC_MUTEX_UNLOCK(rpc->miner_mutex);
+            return;
+        }
+    }
+
+    /* Miner not found - add new miner inline */
+    if (rpc->miner_count < FTC_MAX_MINERS) {
+        ftc_miner_info_t* miner = &rpc->miners[rpc->miner_count++];
+        strncpy(miner->ip, ip, sizeof(miner->ip) - 1);
+        miner->ip[sizeof(miner->ip) - 1] = '\0';
+        miner->first_seen = now;
+        miner->last_seen = now;
+        miner->requests = 0;
+        miner->blocks_found = accepted ? 1 : 0;
+        miner->blocks_rejected = accepted ? 0 : 1;
+    }
+
+    FTC_RPC_MUTEX_UNLOCK(rpc->miner_mutex);
+}
+
+int ftc_rpc_get_active_miners(ftc_rpc_server_t* rpc)
+{
+    if (!rpc) return 0;
+
+    int64_t now = (int64_t)time(NULL);
+    int active = 0;
+
+    FTC_RPC_MUTEX_LOCK(rpc->miner_mutex);
+
+    for (int i = 0; i < rpc->miner_count; i++) {
+        if (now - rpc->miners[i].last_seen <= FTC_MINER_TIMEOUT) {
+            active++;
+        }
+    }
+
+    FTC_RPC_MUTEX_UNLOCK(rpc->miner_mutex);
+
+    return active;
+}
+
+const ftc_miner_info_t* ftc_rpc_get_miners(ftc_rpc_server_t* rpc, int* count)
+{
+    if (!rpc) {
+        if (count) *count = 0;
+        return NULL;
+    }
+    if (count) *count = rpc->miner_count;
+    return rpc->miners;
 }
 
 /*==============================================================================
@@ -1059,8 +1167,11 @@ static void rpc_getinfo(ftc_rpc_server_t* rpc, ftc_json_t* json, const char* id)
     ftc_json_object_end(json);
 }
 
-static void rpc_getblocktemplate(ftc_rpc_server_t* rpc, ftc_json_t* json, const char* params, const char* id)
+static void rpc_getblocktemplate(ftc_rpc_server_t* rpc, ftc_json_t* json, const char* params, const char* id, const char* client_ip)
 {
+    /* Track miner */
+    ftc_rpc_track_miner(rpc, client_ip);
+
     /* Parse miner address from params */
     char addr_str[64] = {0};
 
@@ -1197,7 +1308,7 @@ static void rpc_getblocksinfo(ftc_rpc_server_t* rpc, ftc_json_t* json, const cha
     ftc_json_object_end(json);
 }
 
-static void rpc_submitblock(ftc_rpc_server_t* rpc, ftc_json_t* json, const char* params, const char* id)
+static void rpc_submitblock(ftc_rpc_server_t* rpc, ftc_json_t* json, const char* params, const char* id, const char* client_ip)
 {
     /* Parse block hex from params */
     const char* p = strchr(params, '"');
@@ -1239,6 +1350,7 @@ static void rpc_submitblock(ftc_rpc_server_t* rpc, ftc_json_t* json, const char*
     free(data);
 
     if (!block) {
+        ftc_rpc_record_block(rpc, client_ip, false);
         rpc_error(json, -1, "Failed to deserialize block", id);
         return;
     }
@@ -1253,6 +1365,9 @@ static void rpc_submitblock(ftc_rpc_server_t* rpc, ftc_json_t* json, const char*
     bool success = rpc->handlers->submit_block(rpc->handlers->user_data, block);
     ftc_block_free(block);
 
+    /* Record block submission */
+    ftc_rpc_record_block(rpc, client_ip, success);
+
     if (!success) {
         rpc_error(json, -1, "Block rejected", id);
         return;
@@ -1266,11 +1381,61 @@ static void rpc_submitblock(ftc_rpc_server_t* rpc, ftc_json_t* json, const char*
     ftc_json_object_end(json);
 }
 
+static void rpc_getminerstats(ftc_rpc_server_t* rpc, ftc_json_t* json, const char* id)
+{
+    int64_t now = (int64_t)time(NULL);
+
+    FTC_RPC_MUTEX_LOCK(rpc->miner_mutex);
+
+    /* Count active miners while holding lock */
+    int active_count = 0;
+    for (int i = 0; i < rpc->miner_count; i++) {
+        if (now - rpc->miners[i].last_seen <= FTC_MINER_TIMEOUT) {
+            active_count++;
+        }
+    }
+
+    ftc_json_object_start(json);
+    ftc_json_kv_string(json, "jsonrpc", "2.0");
+
+    ftc_json_key(json, "result");
+    ftc_json_object_start(json);
+    ftc_json_kv_int(json, "active", active_count);
+    ftc_json_kv_int(json, "total", rpc->miner_count);
+    ftc_json_kv_int(json, "timeout_seconds", FTC_MINER_TIMEOUT);
+
+    ftc_json_key(json, "miners");
+    ftc_json_array_start(json);
+
+    for (int i = 0; i < rpc->miner_count; i++) {
+        ftc_miner_info_t* m = &rpc->miners[i];
+        bool is_active = (now - m->last_seen) <= FTC_MINER_TIMEOUT;
+
+        ftc_json_object_start(json);
+        ftc_json_kv_string(json, "ip", m->ip);
+        ftc_json_kv_bool(json, "active", is_active);
+        ftc_json_kv_uint(json, "requests", m->requests);
+        ftc_json_kv_uint(json, "blocks_found", m->blocks_found);
+        ftc_json_kv_uint(json, "blocks_rejected", m->blocks_rejected);
+        ftc_json_kv_int(json, "last_seen_ago", (int)(now - m->last_seen));
+        ftc_json_kv_int(json, "first_seen", (int)m->first_seen);
+        ftc_json_object_end(json);
+    }
+
+    ftc_json_array_end(json);
+    ftc_json_object_end(json);
+
+    FTC_RPC_MUTEX_UNLOCK(rpc->miner_mutex);
+
+    ftc_json_kv_string(json, "id", id);
+    ftc_json_object_end(json);
+}
+
 /*==============================================================================
  * REQUEST HANDLING
  *============================================================================*/
 
-static void process_request(ftc_rpc_server_t* rpc, const char* request, ftc_json_t* response)
+static void process_request(ftc_rpc_server_t* rpc, const char* request, ftc_json_t* response, const char* client_ip)
 {
     /* Parse method and id */
     char method[64] = {0};
@@ -1315,17 +1480,19 @@ static void process_request(ftc_rpc_server_t* rpc, const char* request, ftc_json
     } else if (strcmp(method, "getinfo") == 0) {
         rpc_getinfo(rpc, response, id);
     } else if (strcmp(method, "getblocktemplate") == 0) {
-        rpc_getblocktemplate(rpc, response, params ? params : "[]", id);
+        rpc_getblocktemplate(rpc, response, params ? params : "[]", id, client_ip);
     } else if (strcmp(method, "submitblock") == 0) {
-        rpc_submitblock(rpc, response, params ? params : "[]", id);
+        rpc_submitblock(rpc, response, params ? params : "[]", id, client_ip);
     } else if (strcmp(method, "getblocksinfo") == 0) {
         rpc_getblocksinfo(rpc, response, id);
+    } else if (strcmp(method, "getminerstats") == 0) {
+        rpc_getminerstats(rpc, response, id);
     } else {
         rpc_error(response, -32601, "Method not found", id);
     }
 }
 
-static void handle_client(ftc_rpc_server_t* rpc, ftc_rpc_socket_t client)
+static void handle_client_with_ip(ftc_rpc_server_t* rpc, ftc_rpc_socket_t client, const char* client_ip)
 {
     /* Set receive timeout to prevent blocking */
 #ifdef _WIN32
@@ -1446,7 +1613,7 @@ static void handle_client(ftc_rpc_server_t* rpc, ftc_rpc_socket_t client)
 
     /* Process JSON-RPC request */
     ftc_json_t* response = ftc_json_new();
-    process_request(rpc, body, response);
+    process_request(rpc, body, response, client_ip);
     ftc_json_finalize(response);
 
     /* Send HTTP response */
@@ -1496,7 +1663,11 @@ void ftc_rpc_poll(ftc_rpc_server_t* rpc, int timeout_ms)
         ftc_rpc_socket_t client = accept(rpc->listen_socket, (struct sockaddr*)&addr, &addr_len);
 
         if (client != FTC_RPC_INVALID_SOCKET) {
-            handle_client(rpc, client);
+            /* Extract client IP */
+            char client_ip[64] = {0};
+            inet_ntop(AF_INET, &addr.sin_addr, client_ip, sizeof(client_ip));
+
+            handle_client_with_ip(rpc, client, client_ip);
         } else {
 #ifdef _WIN32
             int err = WSAGetLastError();

@@ -242,43 +242,29 @@ static bool download_blocks_dat(const char* url, const char* dest_path)
 
 static void print_help(void)
 {
-    printf("FTC Node v%s\n", FTC_NODE_VERSION);
+    printf("FTC Central Server v%s\n", FTC_NODE_VERSION);
     printf("\n");
     printf("Usage: ftc-node [options]\n");
     printf("\n");
     printf("Options:\n");
-    printf("  -port <port>       P2P port (default: 17317)\n");
     printf("  -rpcport <port>    RPC port (default: 17318)\n");
     printf("  -datadir <dir>     Data directory (default: ftcdata)\n");
     printf("  -testnet           Use testnet\n");
-    printf("  -seed <host>       Add seed node\n");
     printf("  -bootstrap <url>   Download blocks.dat from node URL\n");
     printf("  -nowallet          Disable wallet\n");
     printf("  -help              Show this help\n");
     printf("\n");
     printf("Example:\n");
-    printf("  ftc-node -datadir /var/ftc -seed seed.flowprotocol.net\n");
+    printf("  ftc-node -datadir /var/ftc -rpcport 17318\n");
     printf("  ftc-node -bootstrap http://seed.flowprotocol.net:17318\n");
     printf("\n");
 }
-
-#define MAX_CUSTOM_SEEDS 16
 
 int main(int argc, char* argv[])
 {
     ftc_node_config_t config;
     ftc_node_config_default(&config);
 
-    /* Default seeds */
-    static const char* default_seeds[] = {
-        "seed.flowprotocol.net",
-        "seed1.flowprotocol.net",
-        "seed2.flowprotocol.net",
-    };
-
-    /* Custom seeds storage */
-    static const char* custom_seeds[MAX_CUSTOM_SEEDS];
-    int custom_seed_count = 0;
     const char* bootstrap_url = NULL;
 
     /* Parse arguments */
@@ -286,9 +272,6 @@ int main(int argc, char* argv[])
         if (strcmp(argv[i], "-help") == 0 || strcmp(argv[i], "--help") == 0) {
             print_help();
             return 0;
-        }
-        else if (strcmp(argv[i], "-port") == 0 && i + 1 < argc) {
-            config.p2p_port = (uint16_t)atoi(argv[++i]);
         }
         else if (strcmp(argv[i], "-rpcport") == 0 && i + 1 < argc) {
             config.rpc_port = (uint16_t)atoi(argv[++i]);
@@ -298,13 +281,6 @@ int main(int argc, char* argv[])
         }
         else if (strcmp(argv[i], "-testnet") == 0) {
             config.testnet = true;
-        }
-        else if (strcmp(argv[i], "-seed") == 0 && i + 1 < argc) {
-            if (custom_seed_count < MAX_CUSTOM_SEEDS) {
-                custom_seeds[custom_seed_count++] = argv[++i];
-            } else {
-                printf("Warning: too many seeds, ignoring %s\n", argv[++i]);
-            }
         }
         else if (strcmp(argv[i], "-bootstrap") == 0 && i + 1 < argc) {
             bootstrap_url = argv[++i];
@@ -317,15 +293,6 @@ int main(int argc, char* argv[])
             print_help();
             return 1;
         }
-    }
-
-    /* Use custom seeds if provided, otherwise use defaults */
-    if (custom_seed_count > 0) {
-        config.seeds = custom_seeds;
-        config.seed_count = custom_seed_count;
-    } else {
-        config.seeds = default_seeds;
-        config.seed_count = 3;
     }
 
     /* Create data directory */
@@ -344,7 +311,7 @@ int main(int argc, char* argv[])
             printf("Delete %s to force re-download\n", blocks_path);
         } else {
             if (!download_blocks_dat(bootstrap_url, blocks_path)) {
-                printf("Bootstrap download failed, continuing with P2P sync\n");
+                printf("Bootstrap download failed\n");
             }
         }
     }

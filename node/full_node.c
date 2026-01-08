@@ -736,9 +736,6 @@ bool ftc_node_submit_block(ftc_node_t* node, ftc_block_t* block)
         return false;
     }
 
-    /* Broadcast to peers */
-    ftc_p2p_broadcast_block(node->p2p, block);
-
     return true;
 }
 
@@ -782,7 +779,8 @@ static double rpc_get_difficulty(void* ctx)
 static int rpc_get_peer_count(void* ctx)
 {
     ftc_node_t* node = (ftc_node_t*)ctx;
-    return node->p2p->peer_count;
+    /* Return active miners count instead of P2P peers */
+    return ftc_rpc_get_active_miners(node->rpc);
 }
 
 static bool rpc_send_tx(void* ctx, ftc_tx_t* tx)
@@ -794,7 +792,6 @@ static bool rpc_send_tx(void* ctx, ftc_tx_t* tx)
     }
 
     ftc_mempool_add(node->mempool, tx, node->utxo_set, node->chain->best_height);
-    ftc_p2p_broadcast_tx(node->p2p, tx);
     return true;
 }
 
@@ -832,9 +829,6 @@ static bool rpc_submit_block(void* ctx, ftc_block_t* block)
         return false;
     }
 
-    /* Broadcast to peers */
-    ftc_p2p_broadcast_block(node->p2p, block);
-
     return true;
 }
 
@@ -845,223 +839,13 @@ static const char* rpc_get_data_dir(void* ctx)
 }
 
 /*==============================================================================
- * P2P CALLBACKS
- *============================================================================*/
-
-static void p2p_on_peer_connected(ftc_p2p_t* p2p, ftc_peer_t* peer)
-{
-    ftc_node_t* node = (ftc_node_t*)p2p->user_data;
-
-    /* Request blocks if peer has more than us */
-    if (peer->start_height > (int)node->chain->best_height) {
-        ftc_hash256_t stop_hash = {0};
-        ftc_peer_send_getheaders(peer, &node->chain->best_hash, 1, stop_hash);
-    }
-}
-
-static void p2p_on_peer_disconnected(ftc_p2p_t* p2p, ftc_peer_t* peer)
-{
-    (void)p2p;
-    (void)peer;
-}
-
-static void p2p_on_block(ftc_p2p_t* p2p, ftc_peer_t* peer, const ftc_block_t* block)
-{
-    (void)peer;
-    ftc_node_t* node = (ftc_node_t*)p2p->user_data;
-
-    ftc_hash256_t hash;
-    ftc_block_hash(block, hash);
-
-    /* Quick duplicate check BEFORE expensive clone */
-    FTC_MUTEX_LOCK(node->chain->mutex);
-    int existing = hash_index_find(node->chain, hash);
-    FTC_MUTEX_UNLOCK(node->chain->mutex);
-
-    if (existing >= 0) {
-        /* Already have this block - skip silently */
-        return;
-    }
-
-    /* Clone block (const removal) */
-    size_t size = ftc_block_serialize(block, NULL, 0);
-    uint8_t* data = (uint8_t*)malloc(size);
-    ftc_block_serialize(block, data, size);
-    ftc_block_t* block_copy = ftc_block_deserialize(data, size);
-    free(data);
-
-    if (block_copy) {
-        if (ftc_chain_add_block(node, block_copy)) {
-            /* Relay to other peers for real-time sync */
-            ftc_p2p_broadcast_block(p2p, block_copy);
-        }
-        ftc_block_free(block_copy);
-    }
-}
-
-static void p2p_on_tx(ftc_p2p_t* p2p, ftc_peer_t* peer, const ftc_tx_t* tx)
-{
-    (void)peer;
-    ftc_node_t* node = (ftc_node_t*)p2p->user_data;
-
-    /* Clone and add to mempool */
-    size_t size = ftc_tx_serialize(tx, NULL, 0);
-    uint8_t* data = (uint8_t*)malloc(size);
-    ftc_tx_serialize(tx, data, size);
-    size_t consumed;
-    ftc_tx_t* tx_copy = ftc_tx_deserialize(data, size, &consumed);
-    free(data);
-
-    if (tx_copy && ftc_node_validate_tx(node, tx_copy)) {
-        if (ftc_mempool_add(node->mempool, tx_copy, node->utxo_set, node->chain->best_height) == FTC_OK) {
-            /* Relay to other peers for real-time sync */
-            ftc_p2p_broadcast_tx(p2p, tx_copy);
-        }
-    } else {
-        ftc_tx_free(tx_copy);
-    }
-}
-
-static void p2p_on_getdata(ftc_p2p_t* p2p, ftc_peer_t* peer, const ftc_inv_t* inv, size_t count)
-{
-    ftc_node_t* node = (ftc_node_t*)p2p->user_data;
-
-    for (size_t i = 0; i < count; i++) {
-        if (inv[i].type == FTC_INV_BLOCK) {
-            ftc_block_t* block = ftc_chain_get_block(node->chain, inv[i].hash);
-            if (block) {
-                ftc_peer_send_block(peer, block);
-            }
-        } else if (inv[i].type == FTC_INV_TX) {
-            ftc_tx_t* tx = ftc_mempool_get(node->mempool, inv[i].hash);
-            if (tx) {
-                ftc_peer_send_tx(peer, tx);
-            }
-        }
-    }
-}
-
-static void p2p_on_inv(ftc_p2p_t* p2p, ftc_peer_t* peer, const ftc_inv_t* inv, size_t count)
-{
-    ftc_node_t* node = (ftc_node_t*)p2p->user_data;
-
-    /* Request unknown items */
-    ftc_inv_t* needed = (ftc_inv_t*)malloc(count * sizeof(ftc_inv_t));
-    size_t needed_count = 0;
-
-    for (size_t i = 0; i < count; i++) {
-        bool have = false;
-
-        if (inv[i].type == FTC_INV_BLOCK) {
-            have = ftc_chain_get_block(node->chain, inv[i].hash) != NULL;
-        } else if (inv[i].type == FTC_INV_TX) {
-            have = ftc_mempool_get(node->mempool, inv[i].hash) != NULL;
-        }
-
-        if (!have) {
-            needed[needed_count++] = inv[i];
-        }
-    }
-
-    if (needed_count > 0) {
-        ftc_peer_send_getdata(peer, needed, needed_count);
-    }
-
-    free(needed);
-}
-
-static void p2p_on_headers(ftc_p2p_t* p2p, ftc_peer_t* peer, const ftc_block_header_t* headers, size_t count)
-{
-    ftc_node_t* node = (ftc_node_t*)p2p->user_data;
-
-    if (count == 0) {
-        return;
-    }
-
-    /* Request blocks for headers we don't have */
-    ftc_inv_t* inv = (ftc_inv_t*)malloc(count * sizeof(ftc_inv_t));
-    if (!inv) return;
-
-    size_t inv_count = 0;
-    for (size_t i = 0; i < count; i++) {
-        ftc_hash256_t header_hash;
-        ftc_hash_block_header(&headers[i], header_hash);
-
-        /* Check if we already have this block */
-        if (!ftc_chain_get_block(node->chain, header_hash)) {
-            inv[inv_count].type = FTC_INV_BLOCK;
-            memcpy(inv[inv_count].hash, header_hash, 32);
-            inv_count++;
-        }
-    }
-
-    if (inv_count > 0) {
-        ftc_peer_send_getdata(peer, inv, inv_count);
-    }
-
-    free(inv);
-
-    /* If we got max headers, request more */
-    if (count >= 2000) {
-        ftc_hash256_t last_hash;
-        ftc_hash_block_header(&headers[count - 1], last_hash);
-        ftc_hash256_t stop_hash = {0};
-        ftc_peer_send_getheaders(peer, &last_hash, 1, stop_hash);
-    }
-}
-
-static void p2p_on_getheaders(ftc_p2p_t* p2p, ftc_peer_t* peer, const ftc_hash256_t* locator, size_t count, const ftc_hash256_t stop_hash)
-{
-    (void)stop_hash;
-    ftc_node_t* node = (ftc_node_t*)p2p->user_data;
-
-    if (count == 0) return;
-
-    /* Find the first locator hash we have */
-    int start_height = -1;
-    for (size_t i = 0; i < count; i++) {
-        for (int j = 0; j < node->chain->block_count; j++) {
-            ftc_hash256_t block_hash;
-            ftc_block_hash(node->chain->blocks[j], block_hash);
-            if (memcmp(block_hash, locator[i], 32) == 0) {
-                start_height = j;
-                break;
-            }
-        }
-        if (start_height >= 0) break;
-    }
-
-    /* Start from genesis if no match */
-    if (start_height < 0) start_height = 0;
-
-    /* Send headers starting from start_height + 1 */
-    size_t header_count = 0;
-    size_t max_headers = 2000;
-    ftc_block_header_t* headers = (ftc_block_header_t*)malloc(max_headers * sizeof(ftc_block_header_t));
-    if (!headers) return;
-
-    for (int i = start_height + 1; i < node->chain->block_count && header_count < max_headers; i++) {
-        memcpy(&headers[header_count], &node->chain->blocks[i]->header, sizeof(ftc_block_header_t));
-        header_count++;
-    }
-
-    if (header_count > 0) {
-        ftc_peer_send_headers(peer, headers, header_count);
-    }
-
-    free(headers);
-}
-
-/*==============================================================================
  * NODE LIFECYCLE
  *============================================================================*/
 
 void ftc_node_config_default(ftc_node_config_t* config)
 {
     memset(config, 0, sizeof(*config));
-    config->p2p_port = FTC_P2P_PORT;
     config->rpc_port = FTC_RPC_PORT;
-    config->listen = true;
     config->testnet = false;
     strcpy(config->data_dir, FTC_DATA_DIR);
     config->wallet_enabled = true;
@@ -1098,17 +882,6 @@ ftc_node_t* ftc_node_new(const ftc_node_config_t* config)
         free(node);
         return NULL;
     }
-
-    /* Create P2P */
-    node->p2p = ftc_p2p_new();
-    if (!node->p2p) {
-        ftc_utxo_set_free(node->utxo_set);
-        ftc_mempool_free(node->mempool);
-        chain_free(node->chain);
-        free(node);
-        return NULL;
-    }
-    node->p2p->user_data = node;
 
     /* Create RPC */
     node->rpc = ftc_rpc_new();
@@ -1150,7 +923,6 @@ void ftc_node_free(ftc_node_t* node)
         ftc_wallet_free(node->wallet);
     }
     if (node->rpc) ftc_rpc_free(node->rpc);
-    if (node->p2p) ftc_p2p_free(node->p2p);
     if (node->utxo_set) ftc_utxo_set_free(node->utxo_set);
     if (node->mempool) ftc_mempool_free(node->mempool);
     if (node->chain) chain_free(node->chain);
@@ -1175,35 +947,6 @@ bool ftc_node_start(ftc_node_t* node)
 
     /* Initialize auto-save state */
     node->last_save_height = node->chain->best_height;
-
-    /* Setup P2P callbacks */
-    static ftc_p2p_callbacks_t p2p_callbacks = {
-        .on_peer_connected = p2p_on_peer_connected,
-        .on_peer_disconnected = p2p_on_peer_disconnected,
-        .on_block = p2p_on_block,
-        .on_tx = p2p_on_tx,
-        .on_inv = p2p_on_inv,
-        .on_getdata = p2p_on_getdata,
-        .on_headers = p2p_on_headers,
-        .on_getheaders = p2p_on_getheaders,
-    };
-    ftc_p2p_set_callbacks(node->p2p, &p2p_callbacks, node);
-
-    /* Add seed nodes */
-    for (int i = 0; i < node->config.seed_count; i++) {
-        ftc_p2p_add_seed(node->p2p, node->config.seeds[i]);
-    }
-
-    /* Start P2P */
-    if (node->config.listen) {
-        if (!ftc_p2p_start(node->p2p, node->config.p2p_port)) {
-            printf("[NODE] Failed to start P2P\n");
-            return false;
-        }
-    }
-
-    /* Fast startup: connect to all seeds immediately for quick sync */
-    ftc_p2p_connect_all_seeds(node->p2p);
 
     /* Setup RPC handlers */
     static ftc_rpc_handlers_t rpc_handlers = {
@@ -1240,21 +983,14 @@ void ftc_node_stop(ftc_node_t* node)
     printf("Saving blockchain and stopping...\n");
 
     ftc_rpc_stop(node->rpc);
-    ftc_p2p_stop(node->p2p);
 
     node->running = false;
 }
 
 void ftc_node_poll(ftc_node_t* node)
 {
-    /* Process P2P */
-    ftc_p2p_poll(node->p2p, 10);
-
     /* Process RPC */
     ftc_rpc_poll(node->rpc, 10);
-
-    /* Update P2P height */
-    ftc_p2p_set_height(node->p2p, node->chain->best_height);
 
     /* Auto-save blockchain: save immediately when new blocks arrive */
     uint32_t height = node->chain->best_height;
@@ -1312,16 +1048,21 @@ static void print_dashboard(ftc_node_t* node)
     /* Move cursor to home and clear screen */
     printf("\033[H\033[J");
 
+    /* Get active miners count */
+    int active_miners = ftc_rpc_get_active_miners(node->rpc);
+
     /* Print dashboard */
     printf("+--------------------------------------------------------------+\n");
-    printf("|            FTC Node v%-10s                              |\n", FTC_NODE_VERSION);
+    printf("|        FTC Central Server v%-10s                       |\n", FTC_NODE_VERSION);
     printf("+--------------------------------------------------------------+\n");
-    printf("|  Height:    %-10u          Peers:     %-3d              |\n",
-           node->chain->best_height, node->p2p->peer_count);
-    printf("|  Best:      ...%-16s   Outbound:  %-3d              |\n",
-           hash_short, node->p2p->outbound_count);
-    printf("|  Mempool:   %-10zu tx       Inbound:   %-3d              |\n",
-           ftc_mempool_count(node->mempool), node->p2p->inbound_count);
+
+    printf("|  Height:    %-10u          Miners:    %-3d active       |\n",
+           node->chain->best_height, active_miners);
+    printf("|  Best:      ...%-16s                                |\n",
+           hash_short);
+    printf("|  Mempool:   %-10zu tx                                    |\n",
+           ftc_mempool_count(node->mempool));
+
     printf("+--------------------------------------------------------------+\n");
     printf("|  Uptime:    %dd %02dh %02dm %02ds                                  |\n",
            days, hours, mins, secs);
@@ -1330,8 +1071,9 @@ static void print_dashboard(ftc_node_t* node)
     printf("|  Last:      %-6lld sec ago                                   |\n",
            (long long)since_block);
     printf("+--------------------------------------------------------------+\n");
-    printf("|  P2P Port:  %-5u               RPC Port:  %-5u            |\n",
-           node->config.p2p_port, node->config.rpc_port);
+
+    printf("|  RPC Port:  %-5u                                            |\n",
+           node->config.rpc_port);
     printf("+--------------------------------------------------------------+\n");
     printf("\n  Press Ctrl+C to stop\n");
 

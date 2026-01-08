@@ -12,7 +12,6 @@
 #include "../src/core/tx.h"
 #include "../src/core/mempool.h"
 #include "../src/core/consensus.h"
-#include "../src/network/p2p.h"
 #include "../src/rpc/rpc.h"
 #include "../src/wallet/wallet.h"
 
@@ -58,9 +57,7 @@ extern "C" {
 
 typedef struct {
     /* Network */
-    uint16_t        p2p_port;
     uint16_t        rpc_port;
-    bool            listen;
     bool            testnet;
 
     /* Data */
@@ -68,10 +65,6 @@ typedef struct {
 
     /* Wallet */
     bool            wallet_enabled;
-
-    /* Seeds */
-    const char**    seeds;
-    int             seed_count;
 
     /* Logging */
     int             log_level;
@@ -127,7 +120,6 @@ typedef struct {
     /* Components */
     ftc_chain_t*        chain;
     ftc_mempool_t*      mempool;
-    ftc_p2p_t*          p2p;
     ftc_rpc_server_t*   rpc;
     ftc_wallet_t*       wallet;
 
@@ -136,7 +128,6 @@ typedef struct {
 
     /* State */
     bool                running;
-    bool                syncing;
     int64_t             start_time;
 
     /* Dashboard stats */
