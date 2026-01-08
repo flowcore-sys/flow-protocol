@@ -29,6 +29,8 @@ extern int ftc_gpu_cuda_count(void);
 extern ftc_gpu_ctx_t* ftc_gpu_ctx_new_cuda(int device_id, uint32_t batch_size);
 extern void ftc_gpu_ctx_free_cuda(ftc_gpu_ctx_t* ctx);
 extern bool ftc_gpu_set_work_cuda(ftc_gpu_ctx_t* ctx, const uint8_t header[80], const uint8_t target[32]);
+extern void ftc_gpu_launch_cuda(ftc_gpu_ctx_t* ctx, uint32_t nonce_start);
+extern ftc_gpu_result_t ftc_gpu_sync_cuda(ftc_gpu_ctx_t* ctx);
 extern ftc_gpu_result_t ftc_gpu_mine_cuda(ftc_gpu_ctx_t* ctx, uint32_t nonce_start);
 extern double ftc_gpu_get_hashrate_cuda(ftc_gpu_ctx_t* ctx);
 extern uint64_t ftc_gpu_get_total_hashes_cuda(ftc_gpu_ctx_t* ctx);
@@ -41,6 +43,8 @@ static int ftc_gpu_cuda_count(void) { return 0; }
 static ftc_gpu_ctx_t* ftc_gpu_ctx_new_cuda(int device_id, uint32_t batch_size) { (void)device_id; (void)batch_size; return NULL; }
 static void ftc_gpu_ctx_free_cuda(ftc_gpu_ctx_t* ctx) { (void)ctx; }
 static bool ftc_gpu_set_work_cuda(ftc_gpu_ctx_t* ctx, const uint8_t header[80], const uint8_t target[32]) { (void)ctx; (void)header; (void)target; return false; }
+static void ftc_gpu_launch_cuda(ftc_gpu_ctx_t* ctx, uint32_t nonce_start) { (void)ctx; (void)nonce_start; }
+static ftc_gpu_result_t ftc_gpu_sync_cuda(ftc_gpu_ctx_t* ctx) { (void)ctx; ftc_gpu_result_t r = {0}; return r; }
 static ftc_gpu_result_t ftc_gpu_mine_cuda(ftc_gpu_ctx_t* ctx, uint32_t nonce_start) { (void)ctx; (void)nonce_start; ftc_gpu_result_t r = {0}; return r; }
 static double ftc_gpu_get_hashrate_cuda(ftc_gpu_ctx_t* ctx) { (void)ctx; return 0; }
 static uint64_t ftc_gpu_get_total_hashes_cuda(ftc_gpu_ctx_t* ctx) { (void)ctx; return 0; }
@@ -237,6 +241,33 @@ bool ftc_gpu_set_work(ftc_gpu_ctx_t* ctx, const uint8_t header[80], const uint8_
     }
 }
 
+/* Launch kernel asynchronously (non-blocking) */
+void ftc_gpu_launch(ftc_gpu_ctx_t* ctx, uint32_t nonce_start)
+{
+    ftc_gpu_ctx_wrapper_t* wrapper = (ftc_gpu_ctx_wrapper_t*)ctx;
+    if (!wrapper) return;
+
+    if (wrapper->type == FTC_GPU_CUDA) {
+        ftc_gpu_launch_cuda(wrapper->backend_ctx, nonce_start);
+    }
+    /* OpenCL: TODO - for now use synchronous */
+}
+
+/* Synchronize and get results */
+ftc_gpu_result_t ftc_gpu_sync(ftc_gpu_ctx_t* ctx)
+{
+    ftc_gpu_ctx_wrapper_t* wrapper = (ftc_gpu_ctx_wrapper_t*)ctx;
+    ftc_gpu_result_t result = {0};
+    if (!wrapper) return result;
+
+    if (wrapper->type == FTC_GPU_CUDA) {
+        return ftc_gpu_sync_cuda(wrapper->backend_ctx);
+    }
+    /* OpenCL: return empty result for now */
+    return result;
+}
+
+/* Synchronous mining (legacy) */
 ftc_gpu_result_t ftc_gpu_mine(ftc_gpu_ctx_t* ctx, uint32_t nonce_start)
 {
     ftc_gpu_ctx_wrapper_t* wrapper = (ftc_gpu_ctx_wrapper_t*)ctx;
@@ -368,19 +399,26 @@ ftc_gpu_result_t ftc_gpu_farm_mine(ftc_gpu_farm_t* farm)
     ftc_gpu_result_t result = {0};
     if (!farm || farm->device_count == 0) return result;
 
-    /* Mine on each GPU with different nonce ranges */
+    /* PHASE 1: Launch all kernels in parallel (non-blocking) */
     for (int i = 0; i < farm->device_count; i++) {
         uint32_t nonce_start = farm->nonce_offset + i * farm->batch_size;
-        ftc_gpu_result_t dev_result = ftc_gpu_mine(farm->contexts[i], nonce_start);
+        ftc_gpu_launch(farm->contexts[i], nonce_start);
+    }
+
+    /* PHASE 2: Synchronize all GPUs and collect results */
+    for (int i = 0; i < farm->device_count; i++) {
+        ftc_gpu_result_t dev_result = ftc_gpu_sync(farm->contexts[i]);
 
         result.hashes += dev_result.hashes;
-        result.elapsed_ms = dev_result.elapsed_ms;  /* Take last device's time */
+        if (dev_result.elapsed_ms > result.elapsed_ms) {
+            result.elapsed_ms = dev_result.elapsed_ms;  /* Take max time */
+        }
 
-        if (dev_result.found) {
+        if (dev_result.found && !result.found) {
             result.found = true;
             result.nonce = dev_result.nonce;
             memcpy(result.hash, dev_result.hash, 32);
-            break;
+            /* Don't break - need to sync all GPUs to get accurate hashrates */
         }
     }
 

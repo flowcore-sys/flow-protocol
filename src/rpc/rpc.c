@@ -18,6 +18,7 @@
 #else
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <fcntl.h>
@@ -32,9 +33,35 @@
 static void close_rpc_socket(ftc_rpc_socket_t sock)
 {
 #ifdef _WIN32
+    shutdown(sock, SD_BOTH);
     closesocket(sock);
 #else
+    shutdown(sock, SHUT_RDWR);
     close(sock);
+#endif
+}
+
+/* Configure client socket for optimal performance and reduced TIME_WAIT */
+static void configure_client_socket(ftc_rpc_socket_t sock)
+{
+    int opt = 1;
+
+    /* Disable Nagle's algorithm for lower latency */
+#ifdef _WIN32
+    setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, (const char*)&opt, sizeof(opt));
+#else
+    setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
+#endif
+
+    /* Set SO_LINGER to avoid TIME_WAIT accumulation
+     * l_onoff=1, l_linger=0 means send RST on close (no TIME_WAIT) */
+    struct linger ling;
+    ling.l_onoff = 1;
+    ling.l_linger = 0;
+#ifdef _WIN32
+    setsockopt(sock, SOL_SOCKET, SO_LINGER, (const char*)&ling, sizeof(ling));
+#else
+    setsockopt(sock, SOL_SOCKET, SO_LINGER, &ling, sizeof(ling));
 #endif
 }
 
@@ -330,8 +357,25 @@ ftc_rpc_server_t* ftc_rpc_new(void)
     if (!rpc) return NULL;
 
     rpc->listen_socket = FTC_RPC_INVALID_SOCKET;
-    for (int i = 0; i < FTC_RPC_MAX_CONNECTIONS; i++) {
+
+    /* Allocate dynamic client array */
+    rpc->client_capacity = FTC_RPC_INITIAL_CONNECTIONS;
+    rpc->clients = (ftc_rpc_socket_t*)malloc(rpc->client_capacity * sizeof(ftc_rpc_socket_t));
+    if (!rpc->clients) {
+        free(rpc);
+        return NULL;
+    }
+    for (int i = 0; i < rpc->client_capacity; i++) {
         rpc->clients[i] = FTC_RPC_INVALID_SOCKET;
+    }
+
+    /* Allocate dynamic miner array */
+    rpc->miner_capacity = FTC_INITIAL_MINERS;
+    rpc->miners = (ftc_miner_info_t*)calloc(rpc->miner_capacity, sizeof(ftc_miner_info_t));
+    if (!rpc->miners) {
+        free(rpc->clients);
+        free(rpc);
+        return NULL;
     }
 
     /* Initialize miner tracking mutex */
@@ -340,11 +384,48 @@ ftc_rpc_server_t* ftc_rpc_new(void)
     return rpc;
 }
 
+/* Grow client array when needed */
+static bool rpc_grow_clients(ftc_rpc_server_t* rpc)
+{
+    int new_capacity = rpc->client_capacity * 2;
+    ftc_rpc_socket_t* new_clients = (ftc_rpc_socket_t*)realloc(rpc->clients,
+                                                                new_capacity * sizeof(ftc_rpc_socket_t));
+    if (!new_clients) return false;
+
+    /* Initialize new slots */
+    for (int i = rpc->client_capacity; i < new_capacity; i++) {
+        new_clients[i] = FTC_RPC_INVALID_SOCKET;
+    }
+
+    rpc->clients = new_clients;
+    rpc->client_capacity = new_capacity;
+    return true;
+}
+
+/* Grow miner array when needed */
+static bool rpc_grow_miners(ftc_rpc_server_t* rpc)
+{
+    int new_capacity = rpc->miner_capacity * 2;
+    ftc_miner_info_t* new_miners = (ftc_miner_info_t*)realloc(rpc->miners,
+                                                              new_capacity * sizeof(ftc_miner_info_t));
+    if (!new_miners) return false;
+
+    /* Zero new slots */
+    memset(&new_miners[rpc->miner_capacity], 0,
+           (new_capacity - rpc->miner_capacity) * sizeof(ftc_miner_info_t));
+
+    rpc->miners = new_miners;
+    rpc->miner_capacity = new_capacity;
+    return true;
+}
+
 void ftc_rpc_free(ftc_rpc_server_t* rpc)
 {
     if (!rpc) return;
     ftc_rpc_stop(rpc);
     FTC_RPC_MUTEX_DESTROY(rpc->miner_mutex);
+    free(rpc->clients);
+    free(rpc->miners);
     free(rpc);
 }
 
@@ -370,6 +451,10 @@ bool ftc_rpc_start(ftc_rpc_server_t* rpc, uint16_t port)
     setsockopt(rpc->listen_socket, SOL_SOCKET, SO_REUSEADDR, (const char*)&opt, sizeof(opt));
 #else
     setsockopt(rpc->listen_socket, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    /* Allow binding even if TIME_WAIT sockets exist from previous instance */
+#ifdef SO_REUSEPORT
+    setsockopt(rpc->listen_socket, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
+#endif
 #endif
 
     struct sockaddr_in addr;
@@ -387,7 +472,7 @@ bool ftc_rpc_start(ftc_rpc_server_t* rpc, uint16_t port)
         return false;
     }
 
-    if (listen(rpc->listen_socket, 10) != 0) {
+    if (listen(rpc->listen_socket, 1024) != 0) {
 #ifdef _WIN32
         printf("[RPC] listen() failed: %d\n", WSAGetLastError());
 #endif
@@ -412,7 +497,7 @@ void ftc_rpc_stop(ftc_rpc_server_t* rpc)
         rpc->listen_socket = FTC_RPC_INVALID_SOCKET;
     }
 
-    for (int i = 0; i < FTC_RPC_MAX_CONNECTIONS; i++) {
+    for (int i = 0; i < rpc->client_capacity; i++) {
         if (rpc->clients[i] != FTC_RPC_INVALID_SOCKET) {
             close_rpc_socket(rpc->clients[i]);
             rpc->clients[i] = FTC_RPC_INVALID_SOCKET;
@@ -443,17 +528,21 @@ void ftc_rpc_track_miner(ftc_rpc_server_t* rpc, const char* ip)
         }
     }
 
-    /* Add new miner if space available */
-    if (rpc->miner_count < FTC_MAX_MINERS) {
-        ftc_miner_info_t* miner = &rpc->miners[rpc->miner_count++];
-        strncpy(miner->ip, ip, sizeof(miner->ip) - 1);
-        miner->ip[sizeof(miner->ip) - 1] = '\0';
-        miner->first_seen = now;
-        miner->last_seen = now;
-        miner->requests = 1;
-        miner->blocks_found = 0;
-        miner->blocks_rejected = 0;
+    /* Add new miner - grow array if needed */
+    if (rpc->miner_count >= rpc->miner_capacity) {
+        if (!rpc_grow_miners(rpc)) {
+            FTC_RPC_MUTEX_UNLOCK(rpc->miner_mutex);
+            return;  /* Can't grow, skip this miner */
+        }
     }
+    ftc_miner_info_t* miner = &rpc->miners[rpc->miner_count++];
+    strncpy(miner->ip, ip, sizeof(miner->ip) - 1);
+    miner->ip[sizeof(miner->ip) - 1] = '\0';
+    miner->first_seen = now;
+    miner->last_seen = now;
+    miner->requests = 1;
+    miner->blocks_found = 0;
+    miner->blocks_rejected = 0;
 
     FTC_RPC_MUTEX_UNLOCK(rpc->miner_mutex);
 }
@@ -480,17 +569,21 @@ void ftc_rpc_record_block(ftc_rpc_server_t* rpc, const char* ip, bool accepted)
         }
     }
 
-    /* Miner not found - add new miner inline */
-    if (rpc->miner_count < FTC_MAX_MINERS) {
-        ftc_miner_info_t* miner = &rpc->miners[rpc->miner_count++];
-        strncpy(miner->ip, ip, sizeof(miner->ip) - 1);
-        miner->ip[sizeof(miner->ip) - 1] = '\0';
-        miner->first_seen = now;
-        miner->last_seen = now;
-        miner->requests = 0;
-        miner->blocks_found = accepted ? 1 : 0;
-        miner->blocks_rejected = accepted ? 0 : 1;
+    /* Miner not found - add new miner, grow array if needed */
+    if (rpc->miner_count >= rpc->miner_capacity) {
+        if (!rpc_grow_miners(rpc)) {
+            FTC_RPC_MUTEX_UNLOCK(rpc->miner_mutex);
+            return;  /* Can't grow, skip */
+        }
     }
+    ftc_miner_info_t* miner = &rpc->miners[rpc->miner_count++];
+    strncpy(miner->ip, ip, sizeof(miner->ip) - 1);
+    miner->ip[sizeof(miner->ip) - 1] = '\0';
+    miner->first_seen = now;
+    miner->last_seen = now;
+    miner->requests = 0;
+    miner->blocks_found = accepted ? 1 : 0;
+    miner->blocks_rejected = accepted ? 0 : 1;
 
     FTC_RPC_MUTEX_UNLOCK(rpc->miner_mutex);
 }
@@ -1687,6 +1780,9 @@ void ftc_rpc_poll(ftc_rpc_server_t* rpc, int timeout_ms)
         ftc_rpc_socket_t client = accept(rpc->listen_socket, (struct sockaddr*)&addr, &addr_len);
 
         if (client != FTC_RPC_INVALID_SOCKET) {
+            /* Configure socket for optimal performance */
+            configure_client_socket(client);
+
             /* Extract client IP */
             char client_ip[64] = {0};
             inet_ntop(AF_INET, &addr.sin_addr, client_ip, sizeof(client_ip));

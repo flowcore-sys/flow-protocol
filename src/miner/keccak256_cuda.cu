@@ -438,10 +438,10 @@ extern "C" bool ftc_gpu_set_work_cuda(ftc_gpu_ctx_t* ctx, const uint8_t header[8
     return true;
 }
 
-extern "C" ftc_gpu_result_t ftc_gpu_mine_cuda(ftc_gpu_ctx_t* ctx, uint32_t nonce_start)
+/* Launch mining kernel asynchronously (non-blocking) */
+extern "C" void ftc_gpu_launch_cuda(ftc_gpu_ctx_t* ctx, uint32_t nonce_start)
 {
-    ftc_gpu_result_t result = {0};
-    if (!ctx) return result;
+    if (!ctx) return;
 
     cudaSetDevice(ctx->device_id);
 
@@ -466,29 +466,39 @@ extern "C" ftc_gpu_result_t ftc_gpu_mine_cuda(ftc_gpu_ctx_t* ctx, uint32_t nonce
         ctx->d_found
     );
 
-    /* Check for kernel launch error */
-    cudaError_t launch_err = cudaGetLastError();
-    if (launch_err != cudaSuccess) {
-        fprintf(stderr, "CUDA kernel launch error: %s\n", cudaGetErrorString(launch_err));
-    }
-
-    /* Stop timing */
+    /* Stop timing event (will be recorded when kernel completes) */
     cudaEventRecord(ctx->stop_event, ctx->stream);
+}
+
+/* Synchronize and get results from a previously launched kernel */
+extern "C" ftc_gpu_result_t ftc_gpu_sync_cuda(ftc_gpu_ctx_t* ctx)
+{
+    ftc_gpu_result_t result = {0};
+    if (!ctx) return result;
+
+    cudaSetDevice(ctx->device_id);
+
+    /* Wait for kernel completion */
     cudaError_t sync_err = cudaStreamSynchronize(ctx->stream);
     if (sync_err != cudaSuccess) {
-        fprintf(stderr, "CUDA sync error: %s\n", cudaGetErrorString(sync_err));
+        fprintf(stderr, "GPU %d CUDA sync error: %s\n", ctx->device_id, cudaGetErrorString(sync_err));
+        return result;
     }
 
     /* Get elapsed time */
     float elapsed_ms = 0;
-    cudaEventElapsedTime(&elapsed_ms, ctx->start_event, ctx->stop_event);
+    cudaError_t time_err = cudaEventElapsedTime(&elapsed_ms, ctx->start_event, ctx->stop_event);
+    if (time_err != cudaSuccess) {
+        fprintf(stderr, "GPU %d timing error: %s\n", ctx->device_id, cudaGetErrorString(time_err));
+        elapsed_ms = 1.0f;  /* Fallback to avoid div by zero */
+    }
 
     /* Check result */
     uint32_t found = 0;
     cudaMemcpy(&found, ctx->d_found, sizeof(uint32_t), cudaMemcpyDeviceToHost);
 
     result.hashes = ctx->batch_size;
-    result.elapsed_ms = elapsed_ms;
+    result.elapsed_ms = elapsed_ms > 0 ? elapsed_ms : 1.0f;
 
     if (found) {
         result.found = true;
@@ -498,12 +508,17 @@ extern "C" ftc_gpu_result_t ftc_gpu_mine_cuda(ftc_gpu_ctx_t* ctx, uint32_t nonce
 
     /* Update stats */
     ctx->total_hashes += ctx->batch_size;
-    ctx->last_elapsed = elapsed_ms;
-    if (elapsed_ms > 0) {
-        ctx->last_hashrate = (double)ctx->batch_size * 1000.0 / elapsed_ms;
-    }
+    ctx->last_elapsed = result.elapsed_ms;
+    ctx->last_hashrate = (double)ctx->batch_size * 1000.0 / result.elapsed_ms;
 
     return result;
+}
+
+/* Legacy synchronous mining (for compatibility) */
+extern "C" ftc_gpu_result_t ftc_gpu_mine_cuda(ftc_gpu_ctx_t* ctx, uint32_t nonce_start)
+{
+    ftc_gpu_launch_cuda(ctx, nonce_start);
+    return ftc_gpu_sync_cuda(ctx);
 }
 
 extern "C" double ftc_gpu_get_hashrate_cuda(ftc_gpu_ctx_t* ctx)

@@ -31,12 +31,12 @@ extern "C" {
  *============================================================================*/
 
 #define FTC_RPC_PORT            17318
-#define FTC_RPC_MAX_CONNECTIONS 16
+#define FTC_RPC_INITIAL_CONNECTIONS 64
 #define FTC_RPC_MAX_REQUEST     (1024 * 1024)  /* 1MB */
 #define FTC_RPC_MAX_RESPONSE    (4 * 1024 * 1024)  /* 4MB */
 
 /* Miner tracking */
-#define FTC_MAX_MINERS          256
+#define FTC_INITIAL_MINERS      64
 #define FTC_MINER_TIMEOUT       300  /* 5 minutes - consider inactive after this */
 
 /*==============================================================================
@@ -120,13 +120,15 @@ typedef struct {
 
     ftc_rpc_handlers_t* handlers;
 
-    /* Connection tracking */
-    ftc_rpc_socket_t    clients[FTC_RPC_MAX_CONNECTIONS];
+    /* Connection tracking (dynamic array) */
+    ftc_rpc_socket_t*   clients;
     int                 client_count;
+    int                 client_capacity;
 
-    /* Miner tracking (protected by miner_mutex) */
-    ftc_miner_info_t    miners[FTC_MAX_MINERS];
+    /* Miner tracking (dynamic array, protected by miner_mutex) */
+    ftc_miner_info_t*   miners;
     int                 miner_count;
+    int                 miner_capacity;
     ftc_rpc_mutex_t     miner_mutex;
 
 } ftc_rpc_server_t;
