@@ -1229,16 +1229,21 @@ int main(int argc, char* argv[])
             g_nodes[g_active_node].failures++;
             if (g_nodes[g_active_node].failures > 3) {
                 g_nodes[g_active_node].connected = false;
-                log_info("Node %s offline, searching...\n", g_nodes[g_active_node].ip);
+                char ts[16];
+                get_timestamp(ts, sizeof(ts));
+                log_to_buffer("[%s] Node %s offline, searching...", ts, g_nodes[g_active_node].ip);
+                draw_static_display();
                 g_active_node = select_best_node();
                 if (g_active_node < 0) {
-                    log_info("All nodes offline. Retrying in 5s...\n");
+                    log_to_buffer("[%s] All nodes offline. Retrying in 5s...", ts);
+                    draw_static_display();
                     usleep(5000000);
                     update_node_latencies();
                     g_active_node = select_best_node();
                     continue;
                 }
-                log_info("Switched to %s\n", g_nodes[g_active_node].ip);
+                log_to_buffer("[%s] Switched to %s", ts, g_nodes[g_active_node].ip);
+                draw_static_display();
             }
             usleep(2000000);
             continue;
