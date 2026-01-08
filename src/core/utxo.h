@@ -95,11 +95,12 @@ bool ftc_utxo_set_get_by_address(
 );
 
 /**
- * Calculate balance for address
+ * Calculate balance for address (only mature/spendable UTXOs)
  */
 uint64_t ftc_utxo_set_balance(
     const ftc_utxo_set_t* set,
-    const ftc_address_t address
+    const ftc_address_t address,
+    uint32_t current_height
 );
 
 /*==============================================================================

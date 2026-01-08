@@ -231,7 +231,8 @@ bool ftc_utxo_set_get_by_address(
 
 uint64_t ftc_utxo_set_balance(
     const ftc_utxo_set_t* set,
-    const ftc_address_t address
+    const ftc_address_t address,
+    uint32_t current_height
 )
 {
     if (!set || !address) return 0;
@@ -241,7 +242,10 @@ uint64_t ftc_utxo_set_balance(
         utxo_entry_t* entry = set->buckets[i];
         while (entry) {
             if (memcmp(entry->utxo.pubkey_hash, address, 20) == 0) {
-                balance += entry->utxo.value;
+                /* Only count mature/spendable UTXOs */
+                if (ftc_utxo_is_spendable(&entry->utxo, current_height)) {
+                    balance += entry->utxo.value;
+                }
             }
             entry = entry->next;
         }
