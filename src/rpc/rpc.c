@@ -1611,15 +1611,17 @@ static void process_request(ftc_rpc_server_t* rpc, const char* request, ftc_json
 
 static void handle_client_with_ip(ftc_rpc_server_t* rpc, ftc_rpc_socket_t client, const char* client_ip)
 {
-    /* Set receive timeout to prevent blocking */
+    /* Set receive timeout - keep short to avoid blocking other requests */
 #ifdef _WIN32
-    DWORD timeout = 3000;  /* 3 seconds */
+    DWORD timeout = 500;  /* 500ms */
     setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout));
+    setsockopt(client, SOL_SOCKET, SO_SNDTIMEO, (const char*)&timeout, sizeof(timeout));
 #else
     struct timeval tv;
-    tv.tv_sec = 3;
-    tv.tv_usec = 0;
+    tv.tv_sec = 0;
+    tv.tv_usec = 500000;  /* 500ms */
     setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(client, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 #endif
 
     /* Use smaller buffer and dynamic allocation to avoid stack overflow */
