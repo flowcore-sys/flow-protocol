@@ -47,7 +47,6 @@ peers.dat
 Thumbs.db
 
 # Dev only
-node/
 pool-server/
 build-linux/
 deploy/

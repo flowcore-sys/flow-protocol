@@ -342,14 +342,14 @@ struct ftc_gpu_farm {
     uint64_t        total_hashes;
 };
 
-ftc_gpu_farm_t* ftc_gpu_farm_new(uint32_t device_mask)
+ftc_gpu_farm_t* ftc_gpu_farm_new(uint32_t device_mask, uint32_t batch_size)
 {
     if (g_device_count == 0) return NULL;
 
     ftc_gpu_farm_t* farm = (ftc_gpu_farm_t*)calloc(1, sizeof(ftc_gpu_farm_t));
     if (!farm) return NULL;
 
-    farm->batch_size = FTC_GPU_BATCH_SIZE;
+    farm->batch_size = (batch_size > 0) ? batch_size : FTC_GPU_BATCH_SIZE;
     farm->nonce_offset = 0;
 
     /* Initialize selected devices */

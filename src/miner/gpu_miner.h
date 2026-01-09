@@ -177,8 +177,9 @@ typedef struct ftc_gpu_farm ftc_gpu_farm_t;
 /**
  * Create multi-GPU farm
  * device_mask: bitmask of devices to use (0 = all available)
+ * batch_size: hashes per mining iteration (0 = auto)
  */
-ftc_gpu_farm_t* ftc_gpu_farm_new(uint32_t device_mask);
+ftc_gpu_farm_t* ftc_gpu_farm_new(uint32_t device_mask, uint32_t batch_size);
 
 /**
  * Free farm
