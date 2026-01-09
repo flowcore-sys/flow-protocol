@@ -625,7 +625,7 @@ bool ftc_node_validate_block(ftc_node_t* node, const ftc_block_t* block)
         /* Calculate fees */
         uint64_t in_value = 0;
         for (uint32_t j = 0; j < block->txs[i]->input_count; j++) {
-            ftc_utxo_t* utxo = ftc_utxo_set_get(node->utxo_set,
+            const ftc_utxo_t* utxo = ftc_utxo_set_get(node->utxo_set,
                 block->txs[i]->inputs[j].prev_txid,
                 block->txs[i]->inputs[j].prev_index);
             if (utxo) {
@@ -656,7 +656,7 @@ bool ftc_node_validate_tx(ftc_node_t* node, const ftc_tx_t* tx)
     /* Check inputs exist and not spent */
     uint64_t in_value = 0;
     for (uint32_t i = 0; i < tx->input_count; i++) {
-        ftc_utxo_t* utxo = ftc_utxo_set_get(node->utxo_set,
+        const ftc_utxo_t* utxo = ftc_utxo_set_get(node->utxo_set,
             tx->inputs[i].prev_txid, tx->inputs[i].prev_index);
         if (!utxo || utxo->spent) {
             return false;
@@ -695,35 +695,125 @@ ftc_block_t* ftc_node_create_block_template(ftc_node_t* node, const ftc_address_
     /* Calculate bits with difficulty adjustment */
     if (height == 0) {
         block->header.bits = FTC_GENESIS_BITS;
+    } else if (height >= FTC_LWMA_ACTIVATION) {
+        /* LWMA (Linearly Weighted Moving Average) - smooth per-block adjustment
+         * This prevents difficulty oscillation when hashrate changes rapidly.
+         * Recent blocks are weighted more heavily than older blocks.
+         */
+        int window = FTC_LWMA_WINDOW;
+        if ((int)node->chain->block_count < window + 1) {
+            window = node->chain->block_count - 1;
+        }
+        if (window < 1) window = 1;
+
+        /* Calculate weighted sum of solve times */
+        int64_t sum_weighted_time = 0;
+        int64_t sum_weights = 0;
+
+        for (int i = 1; i <= window; i++) {
+            int idx = node->chain->block_count - window - 1 + i;
+            if (idx < 1) idx = 1;
+            int prev_idx = idx - 1;
+            if (prev_idx < 0) prev_idx = 0;
+
+            uint32_t block_time = node->chain->blocks[idx]->header.timestamp;
+            uint32_t prev_time = node->chain->blocks[prev_idx]->header.timestamp;
+            int32_t solve_time = (int32_t)(block_time - prev_time);
+
+            /* Clamp solve time to reasonable bounds */
+            if (solve_time < 1) solve_time = 1;
+            if (solve_time > FTC_TARGET_BLOCK_TIME * 6) solve_time = FTC_TARGET_BLOCK_TIME * 6;
+
+            /* Weight = position in window (1 to window) */
+            int weight = i;
+            sum_weighted_time += (int64_t)solve_time * weight;
+            sum_weights += weight;
+        }
+
+        /* target_weighted_time = target_block_time * sum_weights */
+        int64_t target_weighted_time = (int64_t)FTC_TARGET_BLOCK_TIME * sum_weights;
+
+        /* Prevent division by zero */
+        if (sum_weighted_time < 1) sum_weighted_time = 1;
+
+        /* Get previous target */
+        uint32_t prev_bits = node->chain->blocks[node->chain->block_count - 1]->header.bits;
+        ftc_hash256_t target;
+        ftc_bits_to_target(prev_bits, target);
+
+        /* Calculate adjustment ratio with damping
+         * new_target = prev_target * sum_weighted_time / target_weighted_time
+         * Limit adjustment to 1.5x per block to prevent wild swings
+         */
+        int64_t ratio_num = sum_weighted_time;
+        int64_t ratio_den = target_weighted_time;
+
+        /* Limit adjustment to 150% increase or 67% decrease per block */
+        if (ratio_num > ratio_den * 3 / 2) ratio_num = ratio_den * 3 / 2;
+        if (ratio_num < ratio_den * 2 / 3) ratio_num = ratio_den * 2 / 3;
+
+        /* Apply adjustment to target */
+        uint32_t t32[8];
+        for (int i = 0; i < 8; i++) {
+            t32[i] = (uint32_t)target[i*4] | ((uint32_t)target[i*4+1] << 8) |
+                     ((uint32_t)target[i*4+2] << 16) | ((uint32_t)target[i*4+3] << 24);
+        }
+
+        /* Multiply by ratio_num */
+        uint64_t carry = 0;
+        for (int i = 0; i < 8; i++) {
+            uint64_t prod = (uint64_t)t32[i] * ratio_num + carry;
+            t32[i] = (uint32_t)prod;
+            carry = prod >> 32;
+        }
+
+        /* Divide by ratio_den */
+        uint64_t rem = 0;
+        for (int i = 7; i >= 0; i--) {
+            uint64_t div = (rem << 32) | t32[i];
+            t32[i] = (uint32_t)(div / ratio_den);
+            rem = div % ratio_den;
+        }
+
+        for (int i = 0; i < 8; i++) {
+            target[i*4] = t32[i] & 0xff;
+            target[i*4+1] = (t32[i] >> 8) & 0xff;
+            target[i*4+2] = (t32[i] >> 16) & 0xff;
+            target[i*4+3] = (t32[i] >> 24) & 0xff;
+        }
+
+        block->header.bits = ftc_target_to_bits(target);
+
+        /* Log LWMA adjustment periodically */
+        if (height % 100 == 0) {
+            double diff = ftc_bits_to_difficulty(block->header.bits);
+            printf("[NODE] LWMA difficulty at height %u: %.2f (bits=0x%08x)\n",
+                   height, diff, block->header.bits);
+        }
     } else if (height % FTC_DIFFICULTY_INTERVAL != 0) {
-        /* Not at adjustment boundary - use previous bits */
+        /* Legacy: Not at adjustment boundary - use previous bits */
         block->header.bits = node->chain->blocks[node->chain->block_count - 1]->header.bits;
     } else {
-        /* Difficulty adjustment at interval boundary */
+        /* Legacy: Difficulty adjustment at interval boundary (pre-LWMA) */
         int first_idx = node->chain->block_count - FTC_DIFFICULTY_INTERVAL;
-        /* Skip genesis block (index 0) - its timestamp is from creation, not mining */
         if (first_idx <= 0) first_idx = 1;
 
         uint32_t first_time = node->chain->blocks[first_idx]->header.timestamp;
         uint32_t last_time = node->chain->blocks[node->chain->block_count - 1]->header.timestamp;
 
         int32_t actual_time = (int32_t)(last_time - first_time);
-        /* Adjust target_time proportionally if we have fewer blocks */
         int blocks_counted = node->chain->block_count - 1 - first_idx;
         if (blocks_counted < 1) blocks_counted = 1;
         int32_t target_time = FTC_TARGET_BLOCK_TIME * blocks_counted;
         if (target_time < 1) target_time = 1;
 
-        /* Limit to 4x adjustment */
         if (actual_time < target_time / 4) actual_time = target_time / 4;
         if (actual_time > target_time * 4) actual_time = target_time * 4;
 
-        /* Get current target and adjust */
         uint32_t prev_bits = node->chain->blocks[node->chain->block_count - 1]->header.bits;
         ftc_hash256_t target;
         ftc_bits_to_target(prev_bits, target);
 
-        /* Multiply target by actual_time / target_time */
         uint32_t t32[8];
         for (int i = 0; i < 8; i++) {
             t32[i] = (uint32_t)target[i*4] | ((uint32_t)target[i*4+1] << 8) |
@@ -752,30 +842,23 @@ ftc_block_t* ftc_node_create_block_template(ftc_node_t* node, const ftc_address_
         }
 
         block->header.bits = ftc_target_to_bits(target);
-        printf("[NODE] Difficulty adjusted at height %u: bits=0x%08x\n", height, block->header.bits);
+        printf("[NODE] Legacy difficulty adjusted at height %u: bits=0x%08x\n", height, block->header.bits);
     }
 
-    /* Emergency Difficulty Adjustment (EDA):
-     * If no block found for > 10 minutes, reduce difficulty to help network recover.
-     * Each 10 minutes without a block doubles the target (halves difficulty).
-     * This prevents network stalls when hashrate drops suddenly.
-     */
-    if (node->chain->block_count > 0) {
+    /* Emergency Difficulty Adjustment (EDA) - only for pre-LWMA heights */
+    if (height < FTC_LWMA_ACTIVATION && node->chain->block_count > 0) {
         uint32_t last_block_time = node->chain->blocks[node->chain->block_count - 1]->header.timestamp;
         uint32_t current_time = (uint32_t)time(NULL);
         int32_t time_since_last = (int32_t)(current_time - last_block_time);
 
-        /* If > 10 minutes since last block, apply EDA */
         const int32_t EDA_THRESHOLD = 600;  /* 10 minutes */
         if (time_since_last > EDA_THRESHOLD) {
-            int eda_multiplier = time_since_last / EDA_THRESHOLD;  /* 1x per 10 min */
-            if (eda_multiplier > 8) eda_multiplier = 8;  /* Max 256x easier */
+            int eda_multiplier = time_since_last / EDA_THRESHOLD;
+            if (eda_multiplier > 8) eda_multiplier = 8;
 
-            /* Get current target and double it eda_multiplier times */
             ftc_hash256_t eda_target;
             ftc_bits_to_target(block->header.bits, eda_target);
 
-            /* Shift target left (multiply by 2^eda_multiplier) */
             for (int shift = 0; shift < eda_multiplier; shift++) {
                 uint8_t carry = 0;
                 for (int i = 0; i < 32; i++) {
@@ -798,14 +881,26 @@ ftc_block_t* ftc_node_create_block_template(ftc_node_t* node, const ftc_address_
 
     /* Create coinbase */
     uint64_t reward = ftc_get_block_reward(height);
-    ftc_tx_t* coinbase = ftc_tx_create_coinbase(height, reward, NULL, 0);
-    if (!coinbase) {
-        ftc_block_free(block);
-        return NULL;
+    ftc_tx_t* coinbase = NULL;
+
+    /* Check if P2Pool is active and has share contributors */
+    if (node->p2pool && node->p2pool->pplns && node->p2pool->pplns->miner_count > 0) {
+        /* P2Pool mode: distribute to all PPLNS contributors */
+        coinbase = ftc_p2pool_create_coinbase(node->p2pool, height, reward, 0);
     }
 
-    /* Set coinbase output to miner address */
-    memcpy(coinbase->outputs[0].pubkey_hash, miner_addr, 20);
+    /* Fallback to single miner output if P2Pool not active or no shares */
+    if (!coinbase) {
+        coinbase = ftc_tx_create_coinbase(height, reward, NULL, 0);
+        if (!coinbase) {
+            ftc_block_free(block);
+            FTC_MUTEX_UNLOCK(node->chain->mutex);
+            return NULL;
+        }
+        /* Set coinbase output to miner address */
+        memcpy(coinbase->outputs[0].pubkey_hash, miner_addr, 20);
+    }
+
     ftc_block_add_tx(block, coinbase);
 
     /* Add mempool transactions */
@@ -885,8 +980,74 @@ static double rpc_get_difficulty(void* ctx)
 static int rpc_get_peer_count(void* ctx)
 {
     ftc_node_t* node = (ftc_node_t*)ctx;
-    /* Return active miners count instead of P2P peers */
-    return ftc_rpc_get_active_miners(node->rpc);
+    /* Return P2P peer count + active miners */
+    int p2p_peers = node->p2p ? ftc_p2p_peer_count(node->p2p) : 0;
+    int miners = ftc_rpc_get_active_miners(node->rpc);
+    return p2p_peers + miners;
+}
+
+static int rpc_get_peer_info(void* ctx, char** addresses, int* ports, int64_t* ping_times, int max_peers)
+{
+    ftc_node_t* node = (ftc_node_t*)ctx;
+    int count = 0;
+
+    if (!node->p2p) return 0;
+
+    /* Return connected P2P peers with their addresses and ping times */
+    for (int i = 0; i < FTC_P2P_MAX_PEERS && count < max_peers; i++) {
+        ftc_peer_t* peer = node->p2p->peers[i];
+        if (!peer || peer->state != FTC_PEER_ESTABLISHED) continue;
+
+        /* Convert IP to string */
+        char ip_str[64] = {0};
+        /* Check if it's IPv4-mapped IPv6 (::ffff:x.x.x.x) */
+        if (peer->addr.ip[0] == 0 && peer->addr.ip[1] == 0 &&
+            peer->addr.ip[10] == 0xFF && peer->addr.ip[11] == 0xFF) {
+            /* IPv4 mapped address */
+            snprintf(ip_str, sizeof(ip_str), "%d.%d.%d.%d",
+                     peer->addr.ip[12], peer->addr.ip[13],
+                     peer->addr.ip[14], peer->addr.ip[15]);
+        } else {
+            /* Full IPv6 or simple IPv4 stored directly */
+            snprintf(ip_str, sizeof(ip_str), "%d.%d.%d.%d",
+                     peer->addr.ip[12], peer->addr.ip[13],
+                     peer->addr.ip[14], peer->addr.ip[15]);
+        }
+
+        strncpy(addresses[count], ip_str, 63);
+        addresses[count][63] = '\0';
+        ports[count] = peer->addr.port;
+        ping_times[count] = peer->ping_time;  /* RTT in ms */
+        count++;
+    }
+
+    /* Also add known addresses from peer database */
+    for (int i = 0; i < node->p2p->known_addr_count && count < max_peers; i++) {
+        ftc_netaddr_t* addr = &node->p2p->known_addrs[i];
+
+        /* Convert IP to string */
+        char ip_str[64] = {0};
+        snprintf(ip_str, sizeof(ip_str), "%d.%d.%d.%d",
+                 addr->ip[12], addr->ip[13], addr->ip[14], addr->ip[15]);
+
+        /* Skip if already in list (connected peer) */
+        bool found = false;
+        for (int j = 0; j < count; j++) {
+            if (strcmp(addresses[j], ip_str) == 0 && ports[j] == addr->port) {
+                found = true;
+                break;
+            }
+        }
+        if (found) continue;
+
+        strncpy(addresses[count], ip_str, 63);
+        addresses[count][63] = '\0';
+        ports[count] = addr->port;
+        ping_times[count] = -1;  /* Unknown ping time for non-connected peers */
+        count++;
+    }
+
+    return count;
 }
 
 static bool rpc_send_tx(void* ctx, ftc_tx_t* tx)
@@ -935,6 +1096,11 @@ static bool rpc_submit_block(void* ctx, ftc_block_t* block)
         return false;
     }
 
+    /* Broadcast to P2P network */
+    if (node->p2p) {
+        ftc_p2p_broadcast_block(node->p2p, block);
+    }
+
     return true;
 }
 
@@ -945,6 +1111,60 @@ static const char* rpc_get_data_dir(void* ctx)
 }
 
 /*==============================================================================
+ * P2POOL RPC HANDLERS
+ *============================================================================*/
+
+static bool rpc_p2pool_get_status(void* ctx, int* share_count, int* miner_count, uint64_t* total_work)
+{
+    ftc_node_t* node = (ftc_node_t*)ctx;
+    if (!node->p2pool) return false;
+
+    *share_count = (int)node->p2pool->total_shares;
+    *miner_count = node->p2pool->pplns ? node->p2pool->pplns->miner_count : 0;
+    *total_work = node->p2pool->pplns ? node->p2pool->pplns->total_work : 0;
+    return true;
+}
+
+static bool rpc_p2pool_submit_share(void* ctx, const char* miner_addr, uint64_t work_done, const uint8_t* block_hash)
+{
+    ftc_node_t* node = (ftc_node_t*)ctx;
+    if (!node->p2pool) return false;
+
+    /* Create share from submission */
+    ftc_share_t share = {0};
+    share.version = 1;
+    share.timestamp = (uint32_t)time(NULL);
+    share.work_done = work_done;
+    strncpy(share.miner_address, miner_addr, sizeof(share.miner_address) - 1);
+    if (block_hash) {
+        memcpy(share.block_hash, block_hash, 32);
+    }
+
+    /* Add share to P2Pool */
+    ftc_p2pool_add_share(node->p2pool, &share);
+    return true;
+}
+
+static int rpc_p2pool_get_payouts(void* ctx, uint64_t reward, char** addresses, uint64_t* amounts, int max_payouts)
+{
+    ftc_node_t* node = (ftc_node_t*)ctx;
+    if (!node->p2pool) return 0;
+
+    int count = 0;
+    ftc_payout_t* payouts = ftc_p2pool_get_payouts(node->p2pool, reward, &count);
+    if (!payouts) return 0;
+
+    int result = count < max_payouts ? count : max_payouts;
+    for (int i = 0; i < result; i++) {
+        strncpy(addresses[i], payouts[i].address, 63);
+        amounts[i] = payouts[i].amount;
+    }
+
+    free(payouts);
+    return result;
+}
+
+/*==============================================================================
  * NODE LIFECYCLE
  *============================================================================*/
 
@@ -952,6 +1172,10 @@ void ftc_node_config_default(ftc_node_config_t* config)
 {
     memset(config, 0, sizeof(*config));
     config->rpc_port = FTC_RPC_PORT;
+    config->p2p_port = FTC_MAINNET_PORT;
+    config->stratum_port = STRATUM_DEFAULT_PORT;  /* 3333 */
+    config->listen = true;  /* Accept incoming P2P connections by default */
+    config->stratum_enabled = false;  /* Stratum disabled by default */
     config->testnet = false;
     strcpy(config->data_dir, FTC_DATA_DIR);
     config->wallet_enabled = true;
@@ -1006,6 +1230,31 @@ ftc_node_t* ftc_node_new(const ftc_node_config_t* config)
         }
     }
 
+    /* Create P2P network */
+    uint16_t p2p_port = config->p2p_port ? config->p2p_port : FTC_MAINNET_PORT;
+    node->p2p = ftc_p2p_new(node, p2p_port, config->listen);
+    if (node->p2p) {
+        /* Load saved peers */
+        char peers_path[512];
+        snprintf(peers_path, sizeof(peers_path), "%s/peers.dat", config->data_dir);
+        ftc_p2p_load_peers(node->p2p, peers_path);
+    }
+
+    /* Create P2Pool for decentralized mining */
+    node->p2pool = ftc_p2pool_new(node);
+    if (node->p2pool) {
+        printf("[NODE] P2Pool initialized - decentralized mining enabled\n");
+    }
+
+    /* Create Stratum server if enabled */
+    if (config->stratum_enabled) {
+        uint16_t stratum_port = config->stratum_port ? config->stratum_port : STRATUM_DEFAULT_PORT;
+        node->stratum = ftc_stratum_new(node, stratum_port);
+        if (node->stratum) {
+            printf("[NODE] Stratum server created on port %u\n", stratum_port);
+        }
+    }
+
     return node;
 }
 
@@ -1028,6 +1277,15 @@ void ftc_node_free(ftc_node_t* node)
         ftc_wallet_save(node->wallet, wallet_path);
         ftc_wallet_free(node->wallet);
     }
+    if (node->p2p) {
+        /* Save peers before shutdown */
+        char peers_path[512];
+        snprintf(peers_path, sizeof(peers_path), "%s/peers.dat", node->config.data_dir);
+        ftc_p2p_save_peers(node->p2p, peers_path);
+        ftc_p2p_free(node->p2p);
+    }
+    if (node->p2pool) ftc_p2pool_free(node->p2pool);
+    if (node->stratum) ftc_stratum_free(node->stratum);
     if (node->rpc) ftc_rpc_free(node->rpc);
     if (node->utxo_set) ftc_utxo_set_free(node->utxo_set);
     if (node->mempool) ftc_mempool_free(node->mempool);
@@ -1074,6 +1332,7 @@ bool ftc_node_start(ftc_node_t* node)
         .get_best_hash = rpc_get_best_hash,
         .get_difficulty = rpc_get_difficulty,
         .get_peer_count = rpc_get_peer_count,
+        .get_peer_info = rpc_get_peer_info,
         .send_tx = rpc_send_tx,
         .get_mempool = rpc_get_mempool,
         .get_balance = rpc_get_balance,
@@ -1081,6 +1340,9 @@ bool ftc_node_start(ftc_node_t* node)
         .get_block_template = rpc_get_block_template,
         .submit_block = rpc_submit_block,
         .get_data_dir = rpc_get_data_dir,
+        .p2pool_get_status = rpc_p2pool_get_status,
+        .p2pool_submit_share = rpc_p2pool_submit_share,
+        .p2pool_get_payouts = rpc_p2pool_get_payouts,
     };
     rpc_handlers.user_data = node;
     ftc_rpc_set_handlers(node->rpc, &rpc_handlers);
@@ -1088,6 +1350,43 @@ bool ftc_node_start(ftc_node_t* node)
     /* Start RPC */
     if (!ftc_rpc_start(node->rpc, node->config.rpc_port)) {
         printf("[NODE] Failed to start RPC\n");
+    }
+
+    /* Start P2P network */
+    if (node->p2p) {
+        if (ftc_p2p_start(node->p2p)) {
+            printf("[NODE] P2P network started on port %d\n",
+                   node->config.p2p_port ? node->config.p2p_port : FTC_MAINNET_PORT);
+
+            /* Connect to manually specified nodes (-addnode / -peers) */
+            for (int i = 0; i < node->config.connect_node_count; i++) {
+                const char* addr = node->config.connect_nodes[i];
+                if (!addr) continue;
+
+                /* Parse host:port */
+                char host[256];
+                uint16_t port = FTC_MAINNET_PORT;
+                strncpy(host, addr, sizeof(host) - 1);
+                char* colon = strchr(host, ':');
+                if (colon) {
+                    *colon = '\0';
+                    port = (uint16_t)atoi(colon + 1);
+                }
+
+                printf("[NODE] Connecting to %s:%d...\n", host, port);
+                ftc_p2p_connect(node->p2p, host, port);
+            }
+        }
+    }
+
+    /* Start Stratum server if enabled */
+    if (node->stratum) {
+        if (ftc_stratum_start(node->stratum)) {
+            printf("[NODE] Stratum pool server started on port %d\n",
+                   node->config.stratum_port ? node->config.stratum_port : STRATUM_DEFAULT_PORT);
+        } else {
+            printf("[NODE] WARNING: Failed to start Stratum server\n");
+        }
     }
 
     node->running = true;
@@ -1100,6 +1399,16 @@ void ftc_node_stop(ftc_node_t* node)
 
     printf("Saving blockchain and stopping...\n");
 
+    /* Stop Stratum server */
+    if (node->stratum) {
+        ftc_stratum_stop(node->stratum);
+    }
+
+    /* Stop P2P */
+    if (node->p2p) {
+        ftc_p2p_stop(node->p2p);
+    }
+
     ftc_rpc_stop(node->rpc);
 
     node->running = false;
@@ -1107,6 +1416,16 @@ void ftc_node_stop(ftc_node_t* node)
 
 void ftc_node_poll(ftc_node_t* node)
 {
+    /* Process P2P network */
+    if (node->p2p) {
+        ftc_p2p_poll(node->p2p);
+    }
+
+    /* Process Stratum server */
+    if (node->stratum) {
+        ftc_stratum_poll(node->stratum);
+    }
+
     /* Process RPC */
     ftc_rpc_poll(node->rpc, 10);
 

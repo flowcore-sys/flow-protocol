@@ -14,6 +14,9 @@
 #include "../src/core/consensus.h"
 #include "../src/rpc/rpc.h"
 #include "../src/wallet/wallet.h"
+#include "../src/p2p/p2p.h"
+#include "../src/p2pool/p2pool.h"
+#include "../src/stratum/stratum.h"
 
 #ifdef _WIN32
 #include <windows.h>
@@ -58,6 +61,10 @@ extern "C" {
 typedef struct {
     /* Network */
     uint16_t        rpc_port;
+    uint16_t        p2p_port;           /* P2P listen port */
+    uint16_t        stratum_port;       /* Stratum mining pool port */
+    bool            listen;             /* Accept incoming P2P connections */
+    bool            stratum_enabled;    /* Enable Stratum server for pool mining */
     bool            testnet;
 
     /* Data */
@@ -71,6 +78,10 @@ typedef struct {
 
     /* Recovery mode - skip prev_hash validation when loading */
     bool            recovery_mode;
+
+    /* Seed nodes to connect to (NULL = use defaults) */
+    const char*     connect_nodes[16];
+    int             connect_node_count;
 
 } ftc_node_config_t;
 
@@ -119,7 +130,7 @@ typedef struct {
  * FULL NODE
  *============================================================================*/
 
-typedef struct {
+typedef struct ftc_node {
     /* Configuration */
     ftc_node_config_t   config;
 
@@ -128,6 +139,9 @@ typedef struct {
     ftc_mempool_t*      mempool;
     ftc_rpc_server_t*   rpc;
     ftc_wallet_t*       wallet;
+    ftc_p2p_t*          p2p;            /* P2P network */
+    ftc_p2pool_t*       p2pool;         /* P2Pool decentralized mining */
+    ftc_stratum_t*      stratum;        /* Stratum mining pool server */
 
     /* UTXO set */
     ftc_utxo_set_t*     utxo_set;

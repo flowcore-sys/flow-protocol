@@ -732,6 +732,55 @@ static void rpc_getconnectioncount(ftc_rpc_server_t* rpc, ftc_json_t* json, cons
     ftc_json_object_end(json);
 }
 
+static void rpc_getpeerinfo(ftc_rpc_server_t* rpc, ftc_json_t* json, const char* id)
+{
+    /* Get peer info from handler */
+    #define MAX_PEER_INFO 128
+    char* addresses[MAX_PEER_INFO];
+    int ports[MAX_PEER_INFO];
+    int64_t ping_times[MAX_PEER_INFO];
+    int count = 0;
+
+    /* Allocate address strings */
+    for (int i = 0; i < MAX_PEER_INFO; i++) {
+        addresses[i] = (char*)malloc(64);
+        if (!addresses[i]) {
+            /* Cleanup on failure */
+            for (int j = 0; j < i; j++) free(addresses[j]);
+            rpc_error(json, -32603, "Memory allocation failed", id);
+            return;
+        }
+    }
+
+    if (rpc->handlers && rpc->handlers->get_peer_info) {
+        count = rpc->handlers->get_peer_info(rpc->handlers->user_data,
+                                             addresses, ports, ping_times, MAX_PEER_INFO);
+    }
+
+    ftc_json_object_start(json);
+    ftc_json_kv_string(json, "jsonrpc", "2.0");
+    ftc_json_key(json, "result");
+    ftc_json_array_start(json);
+
+    for (int i = 0; i < count; i++) {
+        ftc_json_object_start(json);
+        ftc_json_kv_string(json, "addr", addresses[i]);
+        ftc_json_kv_int(json, "port", ports[i]);
+        ftc_json_kv_int(json, "pingtime", ping_times[i]);
+        ftc_json_object_end(json);
+    }
+
+    ftc_json_array_end(json);
+    ftc_json_kv_string(json, "id", id);
+    ftc_json_object_end(json);
+
+    /* Cleanup */
+    for (int i = 0; i < MAX_PEER_INFO; i++) {
+        free(addresses[i]);
+    }
+    #undef MAX_PEER_INFO
+}
+
 static void rpc_getbalance(ftc_rpc_server_t* rpc, ftc_json_t* json, const char* params, const char* id)
 {
     /* Parse address from params */
@@ -1474,6 +1523,160 @@ static void rpc_getminerstats(ftc_rpc_server_t* rpc, ftc_json_t* json, const cha
 }
 
 /*==============================================================================
+ * P2POOL RPC METHODS
+ *============================================================================*/
+
+static void rpc_getpoolstatus(ftc_rpc_server_t* rpc, ftc_json_t* json, const char* id)
+{
+    if (!rpc->handlers || !rpc->handlers->p2pool_get_status) {
+        rpc_error(json, -32601, "P2Pool not enabled", id);
+        return;
+    }
+
+    int share_count = 0, miner_count = 0;
+    uint64_t total_work = 0;
+
+    bool ok = rpc->handlers->p2pool_get_status(
+        rpc->handlers->user_data, &share_count, &miner_count, &total_work);
+
+    if (!ok) {
+        rpc_error(json, -32603, "P2Pool error", id);
+        return;
+    }
+
+    ftc_json_object_start(json);
+    ftc_json_kv_string(json, "jsonrpc", "2.0");
+
+    ftc_json_key(json, "result");
+    ftc_json_object_start(json);
+    ftc_json_kv_bool(json, "enabled", true);
+    ftc_json_kv_int(json, "share_count", share_count);
+    ftc_json_kv_int(json, "miner_count", miner_count);
+    ftc_json_kv_uint(json, "total_work", total_work);
+    ftc_json_kv_int(json, "pplns_window", 100);
+    ftc_json_object_end(json);
+
+    ftc_json_kv_string(json, "id", id);
+    ftc_json_object_end(json);
+}
+
+static void rpc_submitshare(ftc_rpc_server_t* rpc, ftc_json_t* json, const char* params, const char* id)
+{
+    if (!rpc->handlers || !rpc->handlers->p2pool_submit_share) {
+        rpc_error(json, -32601, "P2Pool not enabled", id);
+        return;
+    }
+
+    /* Parse params: [miner_address, work_done, block_hash_hex] */
+    char miner_addr[64] = {0};
+    char hash_hex[65] = {0};
+    int64_t work = 0;
+
+    /* Simple param parsing - expects ["addr", work, "hash"] */
+    const char* p = params;
+    while (*p && *p != '"') p++;
+    if (*p == '"') {
+        p++;
+        int i = 0;
+        while (*p && *p != '"' && i < 63) miner_addr[i++] = *p++;
+    }
+
+    /* Find work value */
+    while (*p && (*p < '0' || *p > '9')) p++;
+    while (*p >= '0' && *p <= '9') {
+        work = work * 10 + (*p - '0');
+        p++;
+    }
+
+    /* Find hash */
+    while (*p && *p != '"') p++;
+    if (*p == '"') {
+        p++;
+        int i = 0;
+        while (*p && *p != '"' && i < 64) hash_hex[i++] = *p++;
+    }
+
+    if (!miner_addr[0] || work <= 0) {
+        rpc_error(json, -32602, "Invalid params: need [address, work, hash]", id);
+        return;
+    }
+
+    /* Convert hash hex to bytes */
+    uint8_t block_hash[32] = {0};
+    for (int i = 0; i < 32 && hash_hex[i*2] && hash_hex[i*2+1]; i++) {
+        char byte[3] = {hash_hex[i*2], hash_hex[i*2+1], 0};
+        block_hash[i] = (uint8_t)strtol(byte, NULL, 16);
+    }
+
+    bool ok = rpc->handlers->p2pool_submit_share(
+        rpc->handlers->user_data, miner_addr, (uint64_t)work, block_hash);
+
+    ftc_json_object_start(json);
+    ftc_json_kv_string(json, "jsonrpc", "2.0");
+    ftc_json_kv_bool(json, "result", ok);
+    ftc_json_kv_string(json, "id", id);
+    ftc_json_object_end(json);
+}
+
+static void rpc_getpoolpayouts(ftc_rpc_server_t* rpc, ftc_json_t* json, const char* params, const char* id)
+{
+    if (!rpc->handlers || !rpc->handlers->p2pool_get_payouts) {
+        rpc_error(json, -32601, "P2Pool not enabled", id);
+        return;
+    }
+
+    /* Parse reward from params */
+    int64_t reward = 5000000000;  /* Default 50 FTC */
+    const char* p = params;
+    while (*p && (*p < '0' || *p > '9')) p++;
+    if (*p >= '0' && *p <= '9') {
+        reward = 0;
+        while (*p >= '0' && *p <= '9') {
+            reward = reward * 10 + (*p - '0');
+            p++;
+        }
+    }
+
+    /* Get payouts */
+    #define MAX_PAYOUTS 100
+    char* addresses[MAX_PAYOUTS];
+    uint64_t amounts[MAX_PAYOUTS];
+    for (int i = 0; i < MAX_PAYOUTS; i++) {
+        addresses[i] = malloc(64);
+        addresses[i][0] = 0;
+    }
+
+    int count = rpc->handlers->p2pool_get_payouts(
+        rpc->handlers->user_data, (uint64_t)reward, addresses, amounts, MAX_PAYOUTS);
+
+    ftc_json_object_start(json);
+    ftc_json_kv_string(json, "jsonrpc", "2.0");
+
+    ftc_json_key(json, "result");
+    ftc_json_object_start(json);
+    ftc_json_kv_uint(json, "total_reward", (uint64_t)reward);
+    ftc_json_kv_int(json, "payout_count", count);
+
+    ftc_json_key(json, "payouts");
+    ftc_json_array_start(json);
+    for (int i = 0; i < count; i++) {
+        ftc_json_object_start(json);
+        ftc_json_kv_string(json, "address", addresses[i]);
+        ftc_json_kv_uint(json, "amount", amounts[i]);
+        ftc_json_kv_double(json, "ftc", (double)amounts[i] / 100000000.0);
+        ftc_json_object_end(json);
+    }
+    ftc_json_array_end(json);
+    ftc_json_object_end(json);
+
+    ftc_json_kv_string(json, "id", id);
+    ftc_json_object_end(json);
+
+    for (int i = 0; i < MAX_PAYOUTS; i++) free(addresses[i]);
+    #undef MAX_PAYOUTS
+}
+
+/*==============================================================================
  * REQUEST HANDLING
  *============================================================================*/
 
@@ -1507,6 +1710,8 @@ static void process_request(ftc_rpc_server_t* rpc, const char* request, ftc_json
         rpc_getdifficulty(rpc, response, id);
     } else if (strcmp(method, "getpeercount") == 0 || strcmp(method, "getconnectioncount") == 0) {
         rpc_getpeercount(rpc, response, id);
+    } else if (strcmp(method, "getpeerinfo") == 0) {
+        rpc_getpeerinfo(rpc, response, id);
     } else if (strcmp(method, "getbalance") == 0) {
         rpc_getbalance(rpc, response, params ? params : "[]", id);
     } else if (strcmp(method, "getblock") == 0) {
@@ -1529,6 +1734,12 @@ static void process_request(ftc_rpc_server_t* rpc, const char* request, ftc_json
         rpc_getblocksinfo(rpc, response, id);
     } else if (strcmp(method, "getminerstats") == 0) {
         rpc_getminerstats(rpc, response, id);
+    } else if (strcmp(method, "getpoolstatus") == 0) {
+        rpc_getpoolstatus(rpc, response, id);
+    } else if (strcmp(method, "submitshare") == 0) {
+        rpc_submitshare(rpc, response, params ? params : "[]", id);
+    } else if (strcmp(method, "getpoolpayouts") == 0) {
+        rpc_getpoolpayouts(rpc, response, params ? params : "[]", id);
     } else {
         rpc_error(response, -32601, "Method not found", id);
     }

@@ -57,10 +57,19 @@ set(FTC_CORE_SOURCES
     src/core/mempool.c
 )
 
-# Network sources (P2P removed - centralized architecture)
-set(FTC_NETWORK_SOURCES
-    # Removed: src/network/protocol.c
-    # Removed: src/network/p2p.c
+# P2P Network sources
+set(FTC_P2P_SOURCES
+    src/p2p/p2p.c
+)
+
+# P2Pool sources
+set(FTC_P2POOL_SOURCES
+    src/p2pool/p2pool.c
+)
+
+# Stratum server sources
+set(FTC_STRATUM_SOURCES
+    src/stratum/stratum.c
 )
 
 # Storage sources (when implemented)
@@ -98,7 +107,9 @@ set(FTC_GPU_MINER_SOURCES
 # Core library
 add_library(ftc-core STATIC
     ${FTC_CORE_SOURCES}
-    ${FTC_NETWORK_SOURCES}
+    ${FTC_P2P_SOURCES}
+    ${FTC_P2POOL_SOURCES}
+    ${FTC_STRATUM_SOURCES}
     ${FTC_RPC_SOURCES}
     ${FTC_WALLET_SOURCES}
     ${FTC_MINER_SOURCES}
@@ -235,6 +246,12 @@ add_executable(ftc-genaddr
     tools/genaddr.c
 )
 target_link_libraries(ftc-genaddr ftc-core)
+
+# Wallet CLI
+add_executable(ftc-wallet
+    tools/wallet_cli.c
+)
+target_link_libraries(ftc-wallet ftc-core)
 
 # Full node
 add_executable(ftc-node

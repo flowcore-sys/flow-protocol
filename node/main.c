@@ -248,7 +248,10 @@ static void print_help(void)
     printf("\n");
     printf("Options:\n");
     printf("  -rpcport <port>    RPC port (default: 17318)\n");
+    printf("  -stratum [port]    Enable Stratum pool server (default port: 3333)\n");
     printf("  -datadir <dir>     Data directory (default: ftcdata)\n");
+    printf("  -addnode <ip:port> Add a peer to connect to (can use multiple times)\n");
+    printf("  -peers <file>      Load peers from text file (one per line)\n");
     printf("  -testnet           Use testnet\n");
     printf("  -bootstrap <url>   Download blocks.dat from node URL\n");
     printf("  -nowallet          Disable wallet\n");
@@ -256,8 +259,9 @@ static void print_help(void)
     printf("  -help              Show this help\n");
     printf("\n");
     printf("Example:\n");
+    printf("  ftc-node -addnode 15.164.228.225:17319\n");
+    printf("  ftc-node -peers peers.txt\n");
     printf("  ftc-node -datadir /var/ftc -rpcport 17318\n");
-    printf("  ftc-node -bootstrap http://seed.flowprotocol.net:17318\n");
     printf("\n");
 }
 
@@ -277,6 +281,13 @@ int main(int argc, char* argv[])
         else if (strcmp(argv[i], "-rpcport") == 0 && i + 1 < argc) {
             config.rpc_port = (uint16_t)atoi(argv[++i]);
         }
+        else if (strcmp(argv[i], "-stratum") == 0) {
+            config.stratum_enabled = true;
+            /* Check if next arg is a port number */
+            if (i + 1 < argc && argv[i + 1][0] != '-') {
+                config.stratum_port = (uint16_t)atoi(argv[++i]);
+            }
+        }
         else if (strcmp(argv[i], "-datadir") == 0 && i + 1 < argc) {
             strncpy(config.data_dir, argv[++i], sizeof(config.data_dir) - 1);
         }
@@ -292,6 +303,34 @@ int main(int argc, char* argv[])
         else if (strcmp(argv[i], "-recover") == 0) {
             config.recovery_mode = true;
             printf("*** RECOVERY MODE: Loading blocks without validation ***\n");
+        }
+        else if (strcmp(argv[i], "-addnode") == 0 && i + 1 < argc) {
+            if (config.connect_node_count < 16) {
+                config.connect_nodes[config.connect_node_count++] = argv[++i];
+            }
+        }
+        else if (strcmp(argv[i], "-peers") == 0 && i + 1 < argc) {
+            /* Load peers from text file */
+            const char* peers_file = argv[++i];
+            FILE* f = fopen(peers_file, "r");
+            if (f) {
+                char line[256];
+                while (fgets(line, sizeof(line), f) && config.connect_node_count < 16) {
+                    /* Remove newline */
+                    char* nl = strchr(line, '\n');
+                    if (nl) *nl = '\0';
+                    char* cr = strchr(line, '\r');
+                    if (cr) *cr = '\0';
+                    /* Skip empty lines and comments */
+                    if (line[0] && line[0] != '#') {
+                        config.connect_nodes[config.connect_node_count++] = strdup(line);
+                    }
+                }
+                fclose(f);
+                printf("Loaded %d peers from %s\n", config.connect_node_count, peers_file);
+            } else {
+                printf("Warning: Could not open peers file: %s\n", peers_file);
+            }
         }
         else {
             printf("Unknown option: %s\n", argv[i]);

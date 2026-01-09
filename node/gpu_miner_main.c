@@ -145,7 +145,8 @@ static void bytes_to_hex(const uint8_t* data, size_t len, char* hex) {
 
 typedef enum {
     MINING_MODE_SOLO,
-    MINING_MODE_POOL
+    MINING_MODE_POOL,
+    MINING_MODE_P2POOL
 } mining_mode_t;
 
 typedef struct {
@@ -220,11 +221,14 @@ typedef struct {
 static pool_stats_t g_pool_stats = {0};
 #define POOL_STATS_INTERVAL 5000  /* Update every 5 seconds */
 
-static const char* DNS_SEEDS[] = {
-    "seed.flowprotocol.net",
-    "seed1.flowprotocol.net",
-    NULL
-};
+/* P2Pool stats */
+static uint64_t g_p2pool_shares_submitted = 0;
+static uint64_t g_p2pool_shares_accepted = 0;
+static uint32_t g_p2pool_share_target = 0x1f00ffff;  /* Lower difficulty for shares */
+
+/* No hardcoded seeds - users must specify via -node or -peers */
+static char g_seed_nodes[16][256] = {0};
+static int g_seed_count = 0;
 
 /*==============================================================================
  * NODE MANAGEMENT
@@ -540,21 +544,32 @@ static bool is_local_ip(const char* ip)
 }
 
 /* Quick connectivity test (returns latency or 9999 if unreachable) */
-static int quick_connect_test(const char* ip, uint16_t port)
+static int quick_connect_test(const char* host, uint16_t port)
 {
+    /* Resolve hostname using getaddrinfo (supports both DNS and IP) */
+    struct addrinfo hints, *result;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+
+    char port_str[16];
+    snprintf(port_str, sizeof(port_str), "%u", port);
+
+    if (getaddrinfo(host, port_str, &hints, &result) != 0) {
+        return 9999;
+    }
+
     miner_socket_t sock = create_tcp_socket();
-    if (sock == MINER_INVALID_SOCKET) return 9999;
+    if (sock == MINER_INVALID_SOCKET) {
+        freeaddrinfo(result);
+        return 9999;
+    }
 
-set_socket_nonblocking(sock);
-
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(port);
-    inet_pton(AF_INET, ip, &addr.sin_addr);
+    set_socket_nonblocking(sock);
 
     int64_t start = get_time_ms();
-    connect(sock, (struct sockaddr*)&addr, sizeof(addr));
+    connect(sock, result->ai_addr, (int)result->ai_addrlen);
+    freeaddrinfo(result);
 
     fd_set writefds;
     FD_ZERO(&writefds);
@@ -563,13 +578,18 @@ set_socket_nonblocking(sock);
     struct timeval tv = {1, 0};  /* 1 second timeout */
     int ret = select((int)sock + 1, NULL, &writefds, NULL, &tv);
 
-close_socket(sock);
+    close_socket(sock);
 
     if (ret > 0) {
         return (int)(get_time_ms() - start);
     }
     return 9999;
 }
+
+/* Forward declarations for node management functions */
+static void update_node_latencies(void);
+static void load_discovered_nodes(void);
+static char* rpc_call(int node_idx, const char* method, const char* params);
 
 static void discover_nodes(void)
 {
@@ -600,56 +620,92 @@ static void discover_nodes(void)
         return;
     }
 
-    for (int i = 0; DNS_SEEDS[i] != NULL && g_node_count < MAX_NODES; i++) {
-        struct addrinfo hints, *result, *rp;
+    /* Use user-provided seed nodes */
+    for (int i = 0; i < g_seed_count && g_node_count < MAX_NODES; i++) {
+        char host[256];
+        uint16_t port = RPC_PORT;
+        strncpy(host, g_seed_nodes[i], sizeof(host) - 1);
+
+        /* Parse host:port */
+        char* colon = strchr(host, ':');
+        if (colon) {
+            *colon = '\0';
+            port = (uint16_t)atoi(colon + 1);
+        }
+
+        /* Resolve hostname/IP using getaddrinfo */
+        struct addrinfo hints, *result;
         memset(&hints, 0, sizeof(hints));
         hints.ai_family = AF_INET;
         hints.ai_socktype = SOCK_STREAM;
 
-        if (getaddrinfo(DNS_SEEDS[i], NULL, &hints, &result) != 0) continue;
+        char port_str[16];
+        snprintf(port_str, sizeof(port_str), "%u", port);
 
-        for (rp = result; rp != NULL && g_node_count < MAX_NODES; rp = rp->ai_next) {
-            struct sockaddr_in* addr = (struct sockaddr_in*)rp->ai_addr;
-            char ip[64];
-            inet_ntop(AF_INET, &addr->sin_addr, ip, sizeof(ip));
+        if (getaddrinfo(host, port_str, &hints, &result) != 0) continue;
 
-            if (ip_exists(ip)) continue;
-            if (is_local_ip(ip)) continue;  /* Skip local interface IPs */
+        struct sockaddr_in* addr = (struct sockaddr_in*)result->ai_addr;
+        char ip[64];
+        inet_ntop(AF_INET, &addr->sin_addr, ip, sizeof(ip));
 
-            /* Test connectivity - skip unreachable nodes (including own external IP behind NAT) */
-            int latency = quick_connect_test(ip, RPC_PORT);
-            if (latency >= 5000) continue;  /* Skip if can't connect in 5s */
-
-            strncpy(g_nodes[g_node_count].host, DNS_SEEDS[i], sizeof(g_nodes[g_node_count].host) - 1);
-            strncpy(g_nodes[g_node_count].ip, ip, sizeof(g_nodes[g_node_count].ip) - 1);
-            g_nodes[g_node_count].port = RPC_PORT;
-            g_nodes[g_node_count].latency_ms = latency;
-            g_nodes[g_node_count].active = true;
-            g_nodes[g_node_count].connected = true;
-            g_nodes[g_node_count].height = 0;
-            g_nodes[g_node_count].failures = 0;
-            g_node_count++;
+        if (!ip_exists(ip) && !is_local_ip(ip)) {
+            int latency = quick_connect_test(ip, port);
+            if (latency < 5000) {
+                strncpy(g_nodes[g_node_count].host, host, sizeof(g_nodes[g_node_count].host) - 1);
+                strncpy(g_nodes[g_node_count].ip, ip, sizeof(g_nodes[g_node_count].ip) - 1);
+                g_nodes[g_node_count].port = port;
+                g_nodes[g_node_count].latency_ms = latency;
+                g_nodes[g_node_count].active = true;
+                g_nodes[g_node_count].connected = true;
+                g_nodes[g_node_count].height = 0;
+                g_nodes[g_node_count].failures = 0;
+                g_node_count++;
+            }
         }
         freeaddrinfo(result);
+    }
+
+    /* Load previously discovered nodes from file */
+    load_discovered_nodes();
+
+    /* Update latencies for loaded nodes */
+    if (g_node_count > 0) {
+        update_node_latencies();
+    }
+
+    if (g_node_count == 0 && g_seed_count == 0) {
+        printf("No nodes specified. Use -node <ip:port> or -peers <file>\n");
     }
 }
 
 static int measure_latency(const char* host, uint16_t port)
 {
+    /* Resolve hostname using getaddrinfo (supports both DNS and IP) */
+    struct addrinfo hints, *result;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+
+    char port_str[16];
+    snprintf(port_str, sizeof(port_str), "%u", port);
+
+    if (getaddrinfo(host, port_str, &hints, &result) != 0) {
+        return 9999;
+    }
+
     miner_socket_t sock = create_tcp_socket();
-    if (sock == MINER_INVALID_SOCKET) return 9999;
+    if (sock == MINER_INVALID_SOCKET) {
+        freeaddrinfo(result);
+        return 9999;
+    }
 
-set_socket_nonblocking(sock);
-
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    inet_pton(AF_INET, host, &addr.sin_addr);
-    addr.sin_port = htons(port);
+    set_socket_nonblocking(sock);
 
     int64_t start = get_time_ms();
 
-    int ret = connect(sock, (struct sockaddr*)&addr, sizeof(addr));
+    int ret = connect(sock, result->ai_addr, (int)result->ai_addrlen);
+    freeaddrinfo(result);
+
     if (ret != 0 && !socket_would_block()) {
         close_socket(sock);
         return 9999;
@@ -662,13 +718,13 @@ set_socket_nonblocking(sock);
 
     ret = select((int)sock + 1, NULL, &wset, NULL, &tv);
     if (ret <= 0) {
-close_socket(sock);
+        close_socket(sock);
         return 9999;
     }
 
     int64_t elapsed = get_time_ms() - start;
 
-close_socket(sock);
+    close_socket(sock);
 
     return (int)elapsed;
 }
@@ -696,6 +752,235 @@ static int select_best_node(void)
     }
 
     return best;
+}
+
+/*==============================================================================
+ * NODE AUTO-DISCOVERY AND PERSISTENCE
+ *============================================================================*/
+
+#define DISCOVERED_NODES_FILE "miner_nodes.dat"
+#define PEER_DISCOVERY_INTERVAL 60000  /* 60 seconds */
+
+static int64_t g_last_peer_discovery = 0;
+
+/* Save discovered nodes to file */
+static void save_discovered_nodes(void)
+{
+    FILE* f = fopen(DISCOVERED_NODES_FILE, "w");
+    if (!f) return;
+
+    fprintf(f, "# FTC Miner Discovered Nodes\n");
+    fprintf(f, "# Auto-generated, do not edit\n");
+
+    for (int i = 0; i < g_node_count; i++) {
+        if (g_nodes[i].active && g_nodes[i].ip[0]) {
+            fprintf(f, "%s:%d\n", g_nodes[i].ip, g_nodes[i].port);
+        }
+    }
+
+    fclose(f);
+}
+
+/* Load previously discovered nodes from file */
+static void load_discovered_nodes(void)
+{
+    FILE* f = fopen(DISCOVERED_NODES_FILE, "r");
+    if (!f) return;
+
+    char line[256];
+    while (fgets(line, sizeof(line), f) && g_node_count < MAX_NODES) {
+        /* Skip comments and empty lines */
+        if (line[0] == '#' || line[0] == '\n' || line[0] == '\r') continue;
+
+        /* Remove newline */
+        line[strcspn(line, "\r\n")] = '\0';
+        if (strlen(line) == 0) continue;
+
+        /* Parse host:port */
+        char host[256];
+        uint16_t port = RPC_PORT;
+        strncpy(host, line, sizeof(host) - 1);
+
+        char* colon = strchr(host, ':');
+        if (colon) {
+            *colon = '\0';
+            port = (uint16_t)atoi(colon + 1);
+        }
+
+        /* Check if already exists */
+        bool found = false;
+        for (int i = 0; i < g_node_count; i++) {
+            if (strcmp(g_nodes[i].ip, host) == 0 && g_nodes[i].port == port) {
+                found = true;
+                break;
+            }
+        }
+        if (found) continue;
+
+        /* Add to nodes list */
+        strncpy(g_nodes[g_node_count].host, host, sizeof(g_nodes[g_node_count].host) - 1);
+        strncpy(g_nodes[g_node_count].ip, host, sizeof(g_nodes[g_node_count].ip) - 1);
+        g_nodes[g_node_count].port = port;
+        g_nodes[g_node_count].latency_ms = 9999;
+        g_nodes[g_node_count].active = true;
+        g_nodes[g_node_count].connected = false;
+        g_nodes[g_node_count].height = 0;
+        g_nodes[g_node_count].failures = 0;
+        g_node_count++;
+    }
+
+    fclose(f);
+}
+
+/* Query getpeerinfo from a node and discover new peers */
+static void query_peer_info(int node_idx)
+{
+    if (node_idx < 0 || node_idx >= g_node_count) return;
+
+    char* response = rpc_call(node_idx, "getpeerinfo", "[]");
+    if (!response) return;
+
+    /* Parse JSON array of peers */
+    /* Format: {"result":[{"addr":"ip","port":17318,"pingtime":123},...]} */
+    char* result = strstr(response, "\"result\"");
+    if (!result) {
+        free(response);
+        return;
+    }
+
+    int peers_added = 0;
+    char* ptr = result;
+
+    /* Simple JSON parsing - find each peer object */
+    while ((ptr = strstr(ptr, "\"addr\"")) != NULL && g_node_count < MAX_NODES) {
+        ptr += 7;  /* Skip "addr": */
+
+        /* Skip whitespace and quote */
+        while (*ptr == ' ' || *ptr == ':' || *ptr == '"') ptr++;
+
+        /* Extract IP address */
+        char ip[64] = {0};
+        int i = 0;
+        while (*ptr && *ptr != '"' && i < 63) {
+            ip[i++] = *ptr++;
+        }
+        ip[i] = '\0';
+
+        /* Skip empty or invalid */
+        if (strlen(ip) < 7) continue;
+
+        /* Find port */
+        uint16_t port = RPC_PORT;
+        char* port_str = strstr(ptr, "\"port\"");
+        if (port_str) {
+            port_str += 6;
+            while (*port_str == ' ' || *port_str == ':') port_str++;
+            port = (uint16_t)atoi(port_str);
+        }
+
+        /* Skip 0.0.0.0 and local addresses */
+        if (strcmp(ip, "0.0.0.0") == 0) continue;
+        if (strncmp(ip, "127.", 4) == 0) continue;
+        if (strncmp(ip, "192.168.", 8) == 0) continue;
+        if (strncmp(ip, "10.", 3) == 0) continue;
+
+        /* Check if already exists */
+        bool found = false;
+        for (int j = 0; j < g_node_count; j++) {
+            if (strcmp(g_nodes[j].ip, ip) == 0 && g_nodes[j].port == port) {
+                found = true;
+                break;
+            }
+        }
+        if (found) continue;
+
+        /* Add new peer */
+        strncpy(g_nodes[g_node_count].host, ip, sizeof(g_nodes[g_node_count].host) - 1);
+        strncpy(g_nodes[g_node_count].ip, ip, sizeof(g_nodes[g_node_count].ip) - 1);
+        g_nodes[g_node_count].port = port;
+        g_nodes[g_node_count].latency_ms = 9999;
+        g_nodes[g_node_count].active = true;
+        g_nodes[g_node_count].connected = false;
+        g_nodes[g_node_count].height = 0;
+        g_nodes[g_node_count].failures = 0;
+        g_node_count++;
+        peers_added++;
+    }
+
+    free(response);
+
+    if (peers_added > 0) {
+        log_to_buffer("Discovered %d new nodes from peer", peers_added);
+        save_discovered_nodes();
+    }
+}
+
+/* Periodic peer discovery and node health check */
+static void check_node_health_and_discover(void)
+{
+    int64_t now = get_time_ms();
+
+    /* Periodic peer discovery */
+    if (now - g_last_peer_discovery >= PEER_DISCOVERY_INTERVAL) {
+        g_last_peer_discovery = now;
+
+        /* Query peer info from active node */
+        if (g_active_node >= 0 && g_active_node < g_node_count) {
+            query_peer_info(g_active_node);
+        }
+
+        /* Update latencies for all nodes */
+        update_node_latencies();
+
+        /* Check if current node is still the best */
+        int best = select_best_node();
+        if (best >= 0 && best != g_active_node) {
+            if (g_nodes[best].latency_ms < g_nodes[g_active_node].latency_ms - 50) {
+                /* Switch to better node (with 50ms hysteresis) */
+                log_to_buffer("Switching to faster node: %s (%dms)",
+                              g_nodes[best].ip, g_nodes[best].latency_ms);
+                g_active_node = best;
+            }
+        }
+    }
+}
+
+/* Handle node failure - immediate failover */
+static bool handle_node_failure(void)
+{
+    if (g_active_node >= 0 && g_active_node < g_node_count) {
+        g_nodes[g_active_node].failures++;
+        g_nodes[g_active_node].connected = false;
+
+        /* Too many failures - mark as inactive */
+        if (g_nodes[g_active_node].failures >= 3) {
+            log_to_buffer("Node %s marked inactive (too many failures)",
+                          g_nodes[g_active_node].ip);
+            g_nodes[g_active_node].active = false;
+        }
+    }
+
+    /* Find next best node */
+    int best = select_best_node();
+    if (best >= 0 && best != g_active_node) {
+        log_to_buffer("Failover to node: %s", g_nodes[best].ip);
+        g_active_node = best;
+        return true;
+    }
+
+    /* No available nodes - rediscover */
+    log_to_buffer("All nodes failed, rediscovering...");
+    discover_nodes();
+    load_discovered_nodes();
+    update_node_latencies();
+
+    best = select_best_node();
+    if (best >= 0) {
+        g_active_node = best;
+        return true;
+    }
+
+    return false;
 }
 
 /*==============================================================================
@@ -1131,8 +1416,25 @@ static char* rpc_call(int node_idx, const char* method, const char* params)
 
     node_info_t* node = &g_nodes[node_idx];
 
+    /* Resolve hostname using getaddrinfo (supports both DNS and IP) */
+    struct addrinfo hints, *result;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+
+    char port_str[16];
+    snprintf(port_str, sizeof(port_str), "%u", node->port);
+
+    if (getaddrinfo(node->ip, port_str, &hints, &result) != 0) {
+        node->failures++;
+        return NULL;
+    }
+
     miner_socket_t sock = create_tcp_socket();
-    if (sock == MINER_INVALID_SOCKET) return NULL;
+    if (sock == MINER_INVALID_SOCKET) {
+        freeaddrinfo(result);
+        return NULL;
+    }
 
 #ifdef _WIN32
     DWORD timeout = 3000;  /* 3 second timeout - more tolerant */
@@ -1144,17 +1446,13 @@ static char* rpc_call(int node_idx, const char* method, const char* params)
     setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 #endif
 
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    inet_pton(AF_INET, node->ip, &addr.sin_addr);
-    addr.sin_port = htons(node->port);
-
-    if (connect(sock, (struct sockaddr*)&addr, sizeof(addr)) != 0) {
-close_socket(sock);
+    if (connect(sock, result->ai_addr, (int)result->ai_addrlen) != 0) {
+        freeaddrinfo(result);
+        close_socket(sock);
         node->failures++;
         return NULL;
     }
+    freeaddrinfo(result);
 
     char request[4096];
     int req_len = snprintf(request, sizeof(request),
@@ -1322,9 +1620,24 @@ bytes_to_hex(data, size, hex);
         hex);
     free(hex);
 
+    /* Resolve hostname using getaddrinfo (supports both DNS and IP) */
+    struct addrinfo hints, *addrresult;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+
+    char port_str[16];
+    snprintf(port_str, sizeof(port_str), "%u", node->port);
+
+    if (getaddrinfo(node->ip, port_str, &hints, &addrresult) != 0) {
+        free(request);
+        return;
+    }
+
     /* Open socket */
     miner_socket_t sock = create_tcp_socket();
     if (sock == MINER_INVALID_SOCKET) {
+        freeaddrinfo(addrresult);
         free(request);
         return;
     }
@@ -1338,13 +1651,7 @@ bytes_to_hex(data, size, hex);
     setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 #endif
 
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    inet_pton(AF_INET, node->ip, &addr.sin_addr);
-    addr.sin_port = htons(node->port);
-
-    if (connect(sock, (struct sockaddr*)&addr, sizeof(addr)) == 0) {
+    if (connect(sock, addrresult->ai_addr, (int)addrresult->ai_addrlen) == 0) {
         char http[256];
         int http_len = sprintf(http,
             "POST / HTTP/1.1\r\n"
@@ -1359,7 +1666,8 @@ bytes_to_hex(data, size, hex);
         /* Don't wait for response - just close and continue mining */
     }
 
-close_socket(sock);
+    freeaddrinfo(addrresult);
+    close_socket(sock);
     free(request);
 }
 
@@ -1396,9 +1704,24 @@ bytes_to_hex(data, size, hex);
         hex);
     free(hex);
 
+    /* Resolve hostname using getaddrinfo (supports both DNS and IP) */
+    struct addrinfo hints, *addrresult;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+
+    char port_str[16];
+    snprintf(port_str, sizeof(port_str), "%u", node->port);
+
+    if (getaddrinfo(node->ip, port_str, &hints, &addrresult) != 0) {
+        free(request);
+        return false;
+    }
+
     /* Open socket */
     miner_socket_t sock = create_tcp_socket();
     if (sock == MINER_INVALID_SOCKET) {
+        freeaddrinfo(addrresult);
         free(request);
         return false;
     }
@@ -1414,15 +1737,9 @@ bytes_to_hex(data, size, hex);
     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 #endif
 
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    inet_pton(AF_INET, node->ip, &addr.sin_addr);
-    addr.sin_port = htons(node->port);
-
     bool accepted = false;
 
-    if (connect(sock, (struct sockaddr*)&addr, sizeof(addr)) == 0) {
+    if (connect(sock, addrresult->ai_addr, (int)addrresult->ai_addrlen) == 0) {
         char http[256];
         int http_len = sprintf(http,
             "POST / HTTP/1.1\r\n"
@@ -1455,8 +1772,85 @@ bytes_to_hex(data, size, hex);
         }
     }
 
-close_socket(sock);
+    freeaddrinfo(addrresult);
+    close_socket(sock);
     free(request);
+    return accepted;
+}
+
+/* Submit share to P2Pool via RPC */
+static bool submit_p2pool_share(int node_idx, const char* miner_addr, uint64_t work_done, const uint8_t* block_hash)
+{
+    if (node_idx < 0 || node_idx >= g_node_count) return false;
+    node_info_t* node = &g_nodes[node_idx];
+
+    /* Convert block hash to hex */
+    char hash_hex[65];
+    bytes_to_hex(block_hash, 32, hash_hex);
+
+    /* Build JSON-RPC request */
+    char request[512];
+    int req_len = snprintf(request, sizeof(request),
+        "{\"jsonrpc\":\"2.0\",\"method\":\"submitshare\",\"params\":[\"%s\",%llu,\"%s\"],\"id\":1}",
+        miner_addr, (unsigned long long)work_done, hash_hex);
+
+    /* Resolve hostname */
+    struct addrinfo hints, *addrresult;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+
+    char port_str[16];
+    snprintf(port_str, sizeof(port_str), "%u", node->port);
+
+    if (getaddrinfo(node->ip, port_str, &hints, &addrresult) != 0) {
+        return false;
+    }
+
+    miner_socket_t sock = create_tcp_socket();
+    if (sock == MINER_INVALID_SOCKET) {
+        freeaddrinfo(addrresult);
+        return false;
+    }
+
+#ifdef _WIN32
+    DWORD timeout = 500;
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, (char*)&timeout, sizeof(timeout));
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (char*)&timeout, sizeof(timeout));
+#else
+    struct timeval tv = {0, 500000};
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+#endif
+
+    bool accepted = false;
+
+    if (connect(sock, addrresult->ai_addr, (int)addrresult->ai_addrlen) == 0) {
+        char http[256];
+        int http_len = sprintf(http,
+            "POST / HTTP/1.1\r\n"
+            "Host: %s:%d\r\n"
+            "Content-Type: application/json\r\n"
+            "Content-Length: %d\r\n"
+            "Connection: close\r\n\r\n",
+            node->ip, node->port, req_len);
+
+        send(sock, http, http_len, 0);
+        send(sock, request, req_len, 0);
+
+        /* Quick response check */
+        char response[256];
+        int n = recv(sock, response, sizeof(response) - 1, 0);
+        if (n > 0) {
+            response[n] = '\0';
+            if (strstr(response, "\"result\":true") != NULL) {
+                accepted = true;
+            }
+        }
+    }
+
+    freeaddrinfo(addrresult);
+    close_socket(sock);
     return accepted;
 }
 
@@ -1589,8 +1983,9 @@ static void draw_static_display(void)
     }
     printf(C_CLR_LINE "================================================================================\n");
 
-    /* GPU table header - show "Shares" for pool mode, "Blocks" for solo */
-    const char* count_label = (g_mining_mode == MINING_MODE_POOL) ? "Shares" : "Blocks";
+    /* GPU table header - show "Shares" for pool mode, "Blocks" for solo/p2pool */
+    const char* count_label = (g_mining_mode == MINING_MODE_POOL) ? "Shares" :
+                              (g_mining_mode == MINING_MODE_P2POOL) ? "Blk/Shr" : "Blocks";
     printf(C_CLR_LINE C_BOLD " GPU  %-24s  %-12s  %-12s  %s" C_RESET "\n", "Device", "Hashrate", "Avg", count_label);
     printf(C_CLR_LINE "--------------------------------------------------------------------------------\n");
 
@@ -1829,19 +2224,18 @@ static void print_help(void)
     printf("  -address <addr>   Mining reward address (required)\n");
     printf("  -pool <host:port> Pool server (default: %s)\n", DEFAULT_POOL);
     printf("  -pool-pass <pass> Pool password (default: x)\n");
-    printf("  -solo             Solo mining mode (no pool)\n");
-    printf("  -node <host:port> Solo mode: connect to specific node\n");
+    printf("  -solo             Solo mining mode\n");
+    printf("  -p2pool           P2Pool decentralized mining mode\n");
+    printf("  -node <ip:port>   Connect to specific node (can use multiple times)\n");
+    printf("  -peers <file>     Load nodes from text file (one per line)\n");
     printf("  -devices <0,1,2>  GPU device IDs to use (default: all)\n");
     printf("  -intensity <n>    Mining intensity 1-100 (default: 100)\n");
     printf("  -no-color         Disable colored output\n");
     printf("  -list-devices     List available GPUs and exit\n");
     printf("  -help             Show this help\n\n");
-    printf("Pool mining (default):\n");
-    printf("  ftc-miner-gpu -address YOUR_WALLET\n");
-    printf("  ftc-miner-gpu -address YOUR_WALLET -pool custom.pool.com:3333\n\n");
-    printf("Solo mining:\n");
-    printf("  ftc-miner-gpu -address YOUR_WALLET -solo\n");
-    printf("  ftc-miner-gpu -address YOUR_WALLET -solo -node 127.0.0.1:17318\n\n");
+    printf("Solo/P2Pool mining:\n");
+    printf("  ftc-miner-gpu -address WALLET -solo -node 15.164.228.225:17318\n");
+    printf("  ftc-miner-gpu -address WALLET -p2pool -peers nodes.txt\n\n");
 }
 
 static void parse_devices(const char* str)
@@ -1875,7 +2269,37 @@ int main(int argc, char* argv[])
             strncpy(g_miner_address, argv[++i], sizeof(g_miner_address) - 1);
         }
         else if (strcmp(argv[i], "-node") == 0 && i + 1 < argc) {
-            strncpy(g_custom_node, argv[++i], sizeof(g_custom_node) - 1);
+            /* Support both single node (g_custom_node) and multiple (g_seed_nodes) */
+            const char* node_addr = argv[++i];
+            if (g_seed_count < 16) {
+                strncpy(g_seed_nodes[g_seed_count++], node_addr, 255);
+            }
+            /* Also set g_custom_node for backward compatibility */
+            if (g_custom_node[0] == 0) {
+                strncpy(g_custom_node, node_addr, sizeof(g_custom_node) - 1);
+            }
+        }
+        else if (strcmp(argv[i], "-peers") == 0 && i + 1 < argc) {
+            /* Load nodes from text file */
+            const char* peers_file = argv[++i];
+            FILE* f = fopen(peers_file, "r");
+            if (f) {
+                char line[256];
+                while (fgets(line, sizeof(line), f) && g_seed_count < 16) {
+                    char* nl = strchr(line, '\n'); if (nl) *nl = '\0';
+                    char* cr = strchr(line, '\r'); if (cr) *cr = '\0';
+                    if (line[0] && line[0] != '#') {
+                        strncpy(g_seed_nodes[g_seed_count++], line, 255);
+                        if (g_custom_node[0] == 0) {
+                            strncpy(g_custom_node, line, sizeof(g_custom_node) - 1);
+                        }
+                    }
+                }
+                fclose(f);
+                printf("Loaded %d nodes from %s\n", g_seed_count, peers_file);
+            } else {
+                fprintf(stderr, "Error: Could not open peers file: %s\n", peers_file);
+            }
         }
         else if (strcmp(argv[i], "-pool") == 0 && i + 1 < argc) {
             strncpy(g_pool_url, argv[++i], sizeof(g_pool_url) - 1);
@@ -1886,6 +2310,9 @@ int main(int argc, char* argv[])
         }
         else if (strcmp(argv[i], "-solo") == 0) {
             g_mining_mode = MINING_MODE_SOLO;
+        }
+        else if (strcmp(argv[i], "-p2pool") == 0) {
+            g_mining_mode = MINING_MODE_P2POOL;
         }
         else if (strcmp(argv[i], "-devices") == 0 && i + 1 < argc) {
             parse_devices(argv[++i]);
@@ -2197,6 +2624,21 @@ int main(int argc, char* argv[])
                 printf("Connected to %s (latency: %dms)\n",
                        g_nodes[g_active_node].ip,
                        g_nodes[g_active_node].latency_ms);
+
+                /* Discover additional peers from connected node */
+                printf("Discovering peers from network...\n");
+                query_peer_info(g_active_node);
+                if (g_node_count > 1) {
+                    printf("Found %d nodes total\n", g_node_count);
+                    update_node_latencies();
+                    int best = select_best_node();
+                    if (best >= 0 && best != g_active_node) {
+                        g_active_node = best;
+                        printf("Switched to fastest node: %s (%dms)\n",
+                               g_nodes[g_active_node].ip, g_nodes[g_active_node].latency_ms);
+                    }
+                }
+
                 break;  /* Successfully connected */
             }
 
@@ -2226,26 +2668,16 @@ int main(int argc, char* argv[])
             ftc_block_t* block = get_block_template(g_active_node, &height);
 
             if (!block) {
-                g_nodes[g_active_node].failures++;
-                if (g_nodes[g_active_node].failures > 5) {
-                    g_nodes[g_active_node].connected = false;
+                /* Immediate failover on RPC failure */
+                if (!handle_node_failure()) {
+                    /* All nodes failed */
                     char ts[16];
                     get_timestamp(ts, sizeof(ts));
-                    log_to_buffer("[%s] Node %s offline, searching...", ts, g_nodes[g_active_node].ip);
+                    log_to_buffer("[%s] All nodes offline. Retrying in 5s...", ts);
                     draw_static_display();
-                    g_active_node = select_best_node();
-                    if (g_active_node < 0) {
-                        log_to_buffer("[%s] All nodes offline. Retrying in 5s...", ts);
-                        draw_static_display();
-                        usleep(5000000);
-                        update_node_latencies();
-                        g_active_node = select_best_node();
-                        continue;
-                    }
-                    log_to_buffer("[%s] Switched to %s", ts, g_nodes[g_active_node].ip);
-                    draw_static_display();
+                    usleep(5000000);
                 }
-                usleep(2000000);
+                draw_static_display();
                 continue;
             }
 
@@ -2286,6 +2718,14 @@ int main(int argc, char* argv[])
                         g_current_height = height + 1;
                     }
 
+                    /* P2Pool: also submit share for PPLNS tracking */
+                    if (g_mining_mode == MINING_MODE_P2POOL) {
+                        uint64_t work = (uint64_t)(1ULL << 32) / (block->header.bits >> 24);
+                        submit_p2pool_share(g_active_node, g_miner_address, work, result.hash);
+                        g_p2pool_shares_submitted++;
+                        if (accepted) g_p2pool_shares_accepted++;
+                    }
+
                     log_share_found(height, g_last_block_hash, accepted);
 
                     /* Update display after block found */
@@ -2314,15 +2754,9 @@ int main(int argc, char* argv[])
                     last_block_check = now;
                 }
 
-                /* Check latency every 30 seconds */
+                /* Check latency and discover peers every 30 seconds */
                 if (now - last_latency_check >= LATENCY_CHECK_INTERVAL) {
-                    update_node_latencies();
-                    int best = select_best_node();
-                    if (best >= 0 && best != g_active_node) {
-                        if (g_nodes[best].latency_ms + 100 < g_nodes[g_active_node].latency_ms) {
-                            g_active_node = best;
-                        }
-                    }
+                    check_node_health_and_discover();
                     last_latency_check = now;
                 }
             }

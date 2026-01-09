@@ -69,6 +69,7 @@ typedef struct {
     /* Network */
     int (*get_peer_count)(void* ctx);
     int (*get_connection_count)(void* ctx);
+    int (*get_peer_info)(void* ctx, char** addresses, int* ports, int64_t* ping_times, int max_peers);
 
     /* Mining (for external miners) */
     ftc_block_t* (*get_block_template)(void* ctx, const ftc_address_t miner_addr);
@@ -76,6 +77,11 @@ typedef struct {
 
     /* Data directory (for blocks.dat sync) */
     const char* (*get_data_dir)(void* ctx);
+
+    /* P2Pool (decentralized mining) */
+    bool (*p2pool_get_status)(void* ctx, int* share_count, int* miner_count, uint64_t* total_work);
+    bool (*p2pool_submit_share)(void* ctx, const char* miner_addr, uint64_t work_done, const uint8_t* block_hash);
+    int (*p2pool_get_payouts)(void* ctx, uint64_t reward, char** addresses, uint64_t* amounts, int max_payouts);
 
     /* User data */
     void* user_data;
