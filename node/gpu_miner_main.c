@@ -1,6 +1,6 @@
 /**
  * FTC GPU Miner v3.0
- * Clean rewrite with pool (default) and solo modes
+ * Pool mining only (solo mining not supported)
  */
 
 #include <stdio.h>
@@ -102,6 +102,11 @@ typedef struct {
     int recv_len;
     int msg_id;
     int last_submit_id;  /* Track ID of last mining.submit */
+
+    /* Track recent submit IDs for accurate share counting */
+    #define MAX_PENDING_SUBMITS 64
+    int pending_submits[64];
+    int pending_submit_count;
 } stratum_t;
 
 /*==============================================================================
@@ -111,7 +116,7 @@ typedef struct {
 static volatile bool g_running = true;
 static char g_address[128] = {0};
 static char g_password[64] = "x";
-static bool g_solo_mode = false;
+/* Solo mining removed - pool mining only */
 static int g_intensity = 100;
 static uint64_t g_device_mask = 0xFFFFFFFFFFFFFFFF;
 
@@ -353,21 +358,30 @@ static void stratum_handle_msg(stratum_t* s, const char* line) {
                 if (s->pool_difficulty < 1.0) s->pool_difficulty = 1.0;
             }
         }
-    } else if (strstr(line, "\"result\":true") && strstr(line, "\"id\":")) {
-        /* Check if this is a response to our submit */
+    } else if (strstr(line, "\"id\":") && !strstr(line, "\"id\":null")) {
+        /* Parse response ID and check if it's a share response */
         const char* id_str = strstr(line, "\"id\":");
         if (id_str) {
             int resp_id = atoi(id_str + 5);
-            if (resp_id == s->last_submit_id) {
-                s->shares_accepted++;
+            /* Check if this ID is in our pending submits */
+            bool is_share_response = false;
+            for (int i = 0; i < s->pending_submit_count; i++) {
+                if (s->pending_submits[i] == resp_id) {
+                    is_share_response = true;
+                    /* Remove from pending list */
+                    for (int j = i; j < s->pending_submit_count - 1; j++) {
+                        s->pending_submits[j] = s->pending_submits[j + 1];
+                    }
+                    s->pending_submit_count--;
+                    break;
+                }
             }
-        }
-    } else if (strstr(line, "\"result\":false") || strstr(line, "\"error\":")) {
-        const char* id_str = strstr(line, "\"id\":");
-        if (id_str && !strstr(line, "\"id\":null")) {
-            int resp_id = atoi(id_str + 5);
-            if (resp_id == s->last_submit_id) {
-                s->shares_rejected++;
+            if (is_share_response) {
+                if (strstr(line, "\"result\":true")) {
+                    s->shares_accepted++;
+                } else if (strstr(line, "\"result\":false") || strstr(line, "\"error\":")) {
+                    s->shares_rejected++;
+                }
             }
         }
     }
@@ -534,7 +548,14 @@ static void stratum_submit(stratum_t* s, uint32_t nonce, uint32_t ntime) {
     }
 
     char msg[512];
-    s->last_submit_id = s->msg_id;  /* Track this submit's ID */
+    int submit_id = s->msg_id;
+    s->last_submit_id = submit_id;  /* Track this submit's ID */
+
+    /* Add to pending submits for accurate counting */
+    if (s->pending_submit_count < MAX_PENDING_SUBMITS) {
+        s->pending_submits[s->pending_submit_count++] = submit_id;
+    }
+
     snprintf(msg, sizeof(msg),
         "{\"id\":%d,\"method\":\"mining.submit\",\"params\":[\"%s\",\"%s\",\"%s\",\"%08x\",\"%08x\"]}",
         s->msg_id++, g_address, s->job_id, en2_hex, ntime, nonce);
@@ -694,16 +715,20 @@ static void update_pool_stats(void) {
     }
 
 
-    /* Get payouts for this address */
-    char params[256];
-    snprintf(params, sizeof(params), "[\"%s\"]", g_address);
-    if (rpc_request(g_pools[g_active_pool].host, "getpoolpayouts", params, response, sizeof(response))) {
-        char* p = strstr(response, "\"total\":");
-        if (p) g_total_payouts = atof(p + 8);
+    /* Get payouts for this address - track from balance changes */
+    static double prev_balance = 0;
+    static double session_payouts = 0;
+    static int session_payout_count = 0;
 
-        p = strstr(response, "\"count\":");
-        if (p) g_payout_count = atoi(p + 8);
+    if (g_wallet_balance > prev_balance && prev_balance > 0) {
+        double payout = g_wallet_balance - prev_balance;
+        session_payouts += payout;
+        session_payout_count++;
     }
+    prev_balance = g_wallet_balance;
+
+    g_total_payouts = session_payouts;
+    g_payout_count = session_payout_count;
 }
 
 /*==============================================================================
@@ -830,6 +855,27 @@ static void format_hashrate(double hr, char* buf, size_t size) {
     else snprintf(buf, size, "%.0f H/s", hr);
 }
 
+/* Helper: count visible characters (skip ANSI escape sequences) */
+static int visible_len(const char* s) {
+    int len = 0;
+    int in_escape = 0;
+    while (*s) {
+        if (*s == '\033') { in_escape = 1; }
+        else if (in_escape && *s == 'm') { in_escape = 0; }
+        else if (!in_escape) { len++; }
+        s++;
+    }
+    return len;
+}
+
+/* Helper: print a line with exact width padding */
+static void print_row(const char* content) {
+    int len = visible_len(content);
+    printf(C_CYAN "  |" C_RESET "%s", content);
+    for (int i = len; i < 73; i++) printf(" ");
+    printf(C_CYAN "|\n" C_RESET);
+}
+
 static void draw_display(void) {
     double elapsed = (get_time_ms() - g_start_time) / 1000.0;
     if (elapsed < 0.1) elapsed = 0.1;
@@ -844,74 +890,95 @@ static void draw_display(void) {
     int mins = ((int)elapsed % 3600) / 60;
     int secs = (int)elapsed % 60;
 
-    /* Calculate share rate */
     double share_rate = (elapsed > 0) ? (g_stratum.shares_accepted * 60.0 / elapsed) : 0;
+    double efficiency = (g_stratum.shares_accepted + g_stratum.shares_rejected > 0) ?
+        (g_stratum.shares_accepted * 100.0 / (g_stratum.shares_accepted + g_stratum.shares_rejected)) : 100.0;
 
-    /* Calculate countdown to next block */
+    /* Calculate expected time to next block based on pool hashrate and network difficulty */
     int64_t now = get_time_ms();
     int time_since_block = (g_last_block_time > 0) ? (int)((now - g_last_block_time) / 1000) : 0;
-    int countdown = BLOCK_TIME_TARGET - time_since_block;
 
-    printf(C_HOME);
-
-    /* Header */
-    printf(C_CYAN "+==============================================================================+\n" C_RESET);
-    printf(C_CYAN "|" C_RESET "  " C_BOLD C_WHITE "FTC GPU Miner" C_RESET " " C_YELLOW "v%s" C_RESET "                                        " C_GREEN "MINING" C_RESET "  " C_CYAN "|\n" C_RESET, MINER_VERSION);
-    printf(C_CYAN "+==============================================================================+\n" C_RESET);
-
-    /* Pool Info */
-    printf(C_CYAN "|" C_RESET "  " C_BOLD "POOL" C_RESET "                                                                     " C_CYAN "|\n" C_RESET);
-    printf(C_CYAN "|" C_RESET "  Server    : " C_GREEN "%-20s" C_RESET " Port: " C_WHITE "%-5d" C_RESET " Latency: " C_YELLOW "%3d ms" C_RESET "          " C_CYAN "|\n" C_RESET,
-           g_pools[g_active_pool].host, g_pools[g_active_pool].port, g_pools[g_active_pool].latency_ms);
-    printf(C_CYAN "|" C_RESET "  Job ID    : " C_WHITE "%-52s" C_RESET "      " C_CYAN "|\n" C_RESET, g_stratum.job_id);
-    printf(C_CYAN "+------------------------------------------------------------------------------+\n" C_RESET);
-
-    /* Miner Stats */
-    printf(C_CYAN "|" C_RESET "  " C_BOLD "MINER STATS" C_RESET "                                                              " C_CYAN "|\n" C_RESET);
-    printf(C_CYAN "|" C_RESET "  Hashrate  : " C_GREEN C_BOLD "%-14s" C_RESET "   Uptime: " C_WHITE "%02d:%02d:%02d" C_RESET "                        " C_CYAN "|\n" C_RESET,
-           hr_str, hours, mins, secs);
-    printf(C_CYAN "|" C_RESET "  Accepted  : " C_GREEN "%-8llu" C_RESET "         Rejected: " C_RED "%-8llu" C_RESET "                    " C_CYAN "|\n" C_RESET,
-           (unsigned long long)g_stratum.shares_accepted, (unsigned long long)g_stratum.shares_rejected);
-    printf(C_CYAN "|" C_RESET "  Share Rate: " C_WHITE "%.2f/min" C_RESET "        Blocks Found: " C_YELLOW "%-6llu" C_RESET "                   " C_CYAN "|\n" C_RESET,
-           share_rate, (unsigned long long)g_blocks_found);
-    printf(C_CYAN "+------------------------------------------------------------------------------+\n" C_RESET);
-
-    /* Network Stats */
-    printf(C_CYAN "|" C_RESET "  " C_BOLD "NETWORK" C_RESET "                                                                  " C_CYAN "|\n" C_RESET);
-    printf(C_CYAN "|" C_RESET "  Height    : " C_GREEN "%-8u" C_RESET "         Difficulty: " C_YELLOW "%-16.2f" C_RESET "    " C_CYAN "|\n" C_RESET,
-           g_block_height, g_difficulty);
-    if (g_last_block_time == 0) {
-        printf(C_CYAN "|" C_RESET "  Next Block: " C_WHITE "waiting..." C_RESET "       (tracking after first block)            " C_CYAN "|\n" C_RESET);
-    } else if (countdown > 0) {
-        printf(C_CYAN "|" C_RESET "  Next Block: " C_GREEN C_BOLD "~%02d:%02d" C_RESET "           (estimated countdown)                  " C_CYAN "|\n" C_RESET,
-               countdown / 60, countdown % 60);
-    } else {
-        printf(C_CYAN "|" C_RESET "  Next Block: " C_YELLOW C_BOLD "ANY MOMENT" C_RESET "       (overdue +%ds)                          " C_CYAN "|\n" C_RESET,
-               -countdown);
+    int expected_block_time = 60;
+    if (g_pool_hashrate > 0 && g_difficulty > 0) {
+        double hashes_needed = g_difficulty * 4294967296.0;
+        expected_block_time = (int)(hashes_needed / g_pool_hashrate);
+        if (expected_block_time < 1) expected_block_time = 1;
+        /* No cap - show real expected time */
     }
-    printf(C_CYAN "+------------------------------------------------------------------------------+\n" C_RESET);
+    int countdown = expected_block_time - time_since_block;
 
-    /* Pool Stats */
-    printf(C_CYAN "|" C_RESET "  " C_BOLD "POOL" C_RESET "                                                                     " C_CYAN "|\n" C_RESET);
-    printf(C_CYAN "|" C_RESET "  Miners    : " C_GREEN "%-8d" C_RESET "         Pool Hashrate: " C_WHITE "%-14s" C_RESET "      " C_CYAN "|\n" C_RESET,
-           g_pool_miners_online, pool_hr_str);
-    printf(C_CYAN "|" C_RESET "  Pool Blks : " C_YELLOW "%-8d" C_RESET "         (found by this pool)                   " C_CYAN "|\n" C_RESET,
-           g_pool_blocks_found);
-    printf(C_CYAN "+------------------------------------------------------------------------------+\n" C_RESET);
+    char line[256];
+    printf(C_HOME C_CLEAR "\n");
 
-    /* Wallet */
-    printf(C_CYAN "|" C_RESET "  " C_BOLD "WALLET" C_RESET "                                                                   " C_CYAN "|\n" C_RESET);
-    printf(C_CYAN "|" C_RESET "  Address   : " C_MAGENTA "%-52s" C_RESET "      " C_CYAN "|\n" C_RESET, g_address);
-    printf(C_CYAN "|" C_RESET "  Balance   : " C_GREEN C_BOLD "%-18.8f" C_RESET " FTC                                " C_CYAN "|\n" C_RESET, g_wallet_balance);
-    printf(C_CYAN "|" C_RESET "  Payouts   : " C_YELLOW "%-18.8f" C_RESET " FTC  (" C_WHITE "%d" C_RESET " payments)          " C_CYAN "|\n" C_RESET,
-           g_total_payouts, g_payout_count);
-    printf(C_CYAN "+==============================================================================+\n" C_RESET);
+    /* Header - 77 chars total width */
+    printf(C_CYAN "  +=========================================================================+\n");
+    printf("  |" C_BOLD C_WHITE "  FTC GPU Miner " C_YELLOW "v%-4s" C_RESET "                                       " C_GREEN C_BOLD "MINING" C_RESET "  " C_CYAN "|\n", MINER_VERSION);
+    printf("  +=========================================================================+\n" C_RESET);
 
-    /* Status line */
-    if (g_stratum.has_job) {
-        printf(C_GREEN " [MINING]" C_RESET " Working on job...\n");
+    /* Hashrate section - fixed column widths for alignment */
+    print_row("");
+    snprintf(line, sizeof(line), "  Hashrate:   " C_GREEN C_BOLD "%-12s" C_RESET "Uptime:   " C_WHITE "%02d:%02d:%02d" C_RESET "   Share Rate: " C_CYAN "%6.1f" C_RESET "/min",
+             hr_str, hours, mins, secs, share_rate);
+    print_row(line);
+    snprintf(line, sizeof(line), "  Accepted:   " C_GREEN "%-12llu" C_RESET "Rejected: " C_RED "%-8llu" C_RESET "   Efficiency: " C_YELLOW "%5.1f%%" C_RESET,
+             (unsigned long long)g_stratum.shares_accepted, (unsigned long long)g_stratum.shares_rejected, efficiency);
+    print_row(line);
+    print_row("");
+
+    printf(C_CYAN "  +-------------------------------------------------------------------------+\n" C_RESET);
+
+    /* Pool section */
+    snprintf(line, sizeof(line), "  Pool:       " C_GREEN "%-12s" C_RESET "Online:   " C_CYAN "%-8d" C_RESET "   Pool HR:    " C_GREEN "%s" C_RESET,
+             g_pools[g_active_pool].host, g_pool_miners_online, pool_hr_str);
+    print_row(line);
+    snprintf(line, sizeof(line), "  Diff:       " C_YELLOW "%-12.0f" C_RESET "Latency:  " C_CYAN "%-5d" C_RESET "ms   Net Diff:   " C_YELLOW "%.0f" C_RESET,
+             g_stratum.pool_difficulty, g_pools[g_active_pool].latency_ms, g_difficulty);
+    print_row(line);
+    snprintf(line, sizeof(line), "  Height:     " C_GREEN "%-12u" C_RESET "Blocks:   " C_YELLOW "%-8d" C_RESET,
+             g_block_height, g_pool_blocks_found);
+    print_row(line);
+    print_row("");
+
+    printf(C_CYAN "  +-------------------------------------------------------------------------+\n" C_RESET);
+
+    /* Wallet section */
+    snprintf(line, sizeof(line), "  Wallet:     " C_MAGENTA "%s" C_RESET, g_address);
+    print_row(line);
+    snprintf(line, sizeof(line), "  Balance:    " C_GREEN C_BOLD "%-14.4f" C_RESET " FTC  Payouts: " C_YELLOW "%d" C_RESET,
+             g_wallet_balance, g_payout_count);
+    print_row(line);
+    print_row("");
+
+    printf(C_CYAN "  +=========================================================================+\n" C_RESET);
+
+    /* Status line - format time as h:mm:ss or m:ss depending on length */
+    char avg_str[32], countdown_str[32];
+    if (expected_block_time >= 3600) {
+        snprintf(avg_str, sizeof(avg_str), "%dh%02dm", expected_block_time / 3600, (expected_block_time % 3600) / 60);
     } else {
-        printf(C_YELLOW " [WAITING]" C_RESET " Waiting for new job...\n");
+        snprintf(avg_str, sizeof(avg_str), "%dm%02ds", expected_block_time / 60, expected_block_time % 60);
+    }
+
+    if (g_last_block_time == 0 || g_pool_hashrate <= 0) {
+        printf(C_GREEN "\n  [MINING]" C_RESET " Job: " C_WHITE "%s" C_RESET "  Blocks Found: " C_YELLOW "%llu" C_RESET "\n",
+               g_stratum.job_id, (unsigned long long)g_blocks_found);
+    } else if (countdown > 0) {
+        if (countdown >= 3600) {
+            snprintf(countdown_str, sizeof(countdown_str), "%dh%02dm", countdown / 3600, (countdown % 3600) / 60);
+        } else {
+            snprintf(countdown_str, sizeof(countdown_str), "%d:%02d", countdown / 60, countdown % 60);
+        }
+        printf(C_GREEN "\n  [MINING]" C_RESET " Job: " C_WHITE "%s" C_RESET "  Next: " C_GREEN "~%s" C_RESET " (avg %s)  Found: " C_YELLOW "%llu" C_RESET "\n",
+               g_stratum.job_id, countdown_str, avg_str, (unsigned long long)g_blocks_found);
+    } else {
+        int overdue = -countdown;
+        if (overdue >= 3600) {
+            snprintf(countdown_str, sizeof(countdown_str), "%dh%02dm", overdue / 3600, (overdue % 3600) / 60);
+        } else {
+            snprintf(countdown_str, sizeof(countdown_str), "%d:%02d", overdue / 60, overdue % 60);
+        }
+        printf(C_YELLOW "\n  [MINING]" C_RESET " Job: " C_WHITE "%s" C_RESET "  " C_RED "OVERDUE" C_RESET " +%s (avg %s)  Found: " C_YELLOW "%llu" C_RESET "\n",
+               g_stratum.job_id, countdown_str, avg_str, (unsigned long long)g_blocks_found);
     }
 
     fflush(stdout);
@@ -953,10 +1020,24 @@ static void mine_pool(void) {
             continue;
         }
 
-        /* New job? */
+        /* Track whether we need to set new work on the GPU */
+        static uint64_t hashes_this_ntime = 0;
+        static uint32_t last_ntime = 0;
+        bool need_new_work = false;
+
+        /* New job? Reset ntime rolling counter */
         if (strcmp(current_job, g_stratum.job_id) != 0) {
             strncpy(current_job, g_stratum.job_id, sizeof(current_job) - 1);
             g_stratum.extranonce2++;
+            hashes_this_ntime = 0;  /* Fresh job, reset counter */
+            last_ntime = g_stratum.ntime;
+            need_new_work = true;
+        }
+
+        /* Also check if ntime rolled */
+        if (g_stratum.ntime != last_ntime) {
+            last_ntime = g_stratum.ntime;
+            need_new_work = true;
         }
 
         /* Build header */
@@ -968,25 +1049,27 @@ static void mine_pool(void) {
         memcpy(header + 68, &g_stratum.ntime, 4);
         memcpy(header + 72, &g_stratum.nbits, 4);
 
-        /* Calculate share target based on pool difficulty */
-        /* Base diff 1: target[27-29] = 0x0fffff */
-        /* Higher diff = smaller target (divide by difficulty) */
-        uint8_t target[32] = {0};
+        /* Calculate target from pool difficulty */
+        uint8_t target[32];
+        memset(target, 0xff, 32);
         double diff = g_stratum.pool_difficulty;
         if (diff < 1.0) diff = 1.0;
 
-        /* Base target value for diff 1 = 0x0fffff (at bytes 27-29) */
+        /* base_target = 0x0fffff, scaled_target = base_target / difficulty */
+        /* Place in bytes 27-31 (big-endian, MSB at byte 31) */
         uint64_t base_target = 0x0fffffULL;
         uint64_t scaled_target = (uint64_t)(base_target / diff);
-
-        /* Store in little-endian at bytes 27+ */
         target[27] = (uint8_t)(scaled_target & 0xff);
         target[28] = (uint8_t)((scaled_target >> 8) & 0xff);
         target[29] = (uint8_t)((scaled_target >> 16) & 0xff);
         target[30] = (uint8_t)((scaled_target >> 24) & 0xff);
+        target[31] = 0x00;
 
-        /* Mine */
-        ftc_gpu_farm_set_work(g_farm, header, target);
+        /* Only set new work when job or ntime changes */
+        if (need_new_work) {
+            ftc_gpu_farm_set_work(g_farm, header, target);
+        }
+
         ftc_gpu_result_t result = ftc_gpu_farm_mine(g_farm);
 
         /* Poll for new jobs */
@@ -996,7 +1079,14 @@ static void mine_pool(void) {
         if (result.found) {
             stratum_submit(&g_stratum, result.nonce, g_stratum.ntime);
             g_blocks_found++;
+        }
+
+        /* Ntime rolling - when nonce space exhausts, increment timestamp for new work */
+        hashes_this_ntime += result.hashes;
+        if (hashes_this_ntime >= 0x100000000ULL) {  /* 2^32 = full 32-bit nonce space */
+            g_stratum.ntime++;  /* Roll timestamp for fresh work */
             g_stratum.extranonce2++;
+            hashes_this_ntime = 0;
         }
 
         /* Update display */
@@ -1029,7 +1119,7 @@ static void print_help(void) {
     printf("Options:\n");
     printf("  -address <addr>   Mining reward address (required)\n");
     printf("  -node <host:port> Seed node to connect (required)\n");
-    printf("  -solo             Solo mining mode (not implemented)\n");
+    printf("  (Pool mining only - solo mode not supported)\n");
     printf("  -intensity <1-100> Mining intensity (default: 100)\n");
     printf("  -devices <0,1,2>  GPU devices to use\n");
     printf("  -list             List available GPUs\n");
@@ -1049,7 +1139,8 @@ int main(int argc, char** argv) {
         } else if (strcmp(argv[i], "-node") == 0 && i + 1 < argc) {
             strncpy(seed_node, argv[++i], sizeof(seed_node) - 1);
         } else if (strcmp(argv[i], "-solo") == 0) {
-            g_solo_mode = true;
+            fprintf(stderr, "Error: Solo mining not supported. Use pool mining.\n");
+            return 1;
         } else if (strcmp(argv[i], "-intensity") == 0 && i + 1 < argc) {
             g_intensity = atoi(argv[++i]);
             if (g_intensity < 1) g_intensity = 1;
@@ -1108,13 +1199,6 @@ int main(int argc, char** argv) {
     g_farm = ftc_gpu_farm_new(g_device_mask, batch);
     if (!g_farm) {
         fprintf(stderr, "Error: Failed to create GPU farm\n");
-        ftc_gpu_shutdown();
-        return 1;
-    }
-
-    if (g_solo_mode) {
-        printf("Solo mode not implemented yet\n");
-        ftc_gpu_farm_free(g_farm);
         ftc_gpu_shutdown();
         return 1;
     }

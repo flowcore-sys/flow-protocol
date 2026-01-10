@@ -139,6 +139,8 @@ typedef struct {
     uint8_t         ip[16];             /* IPv6 or IPv4-mapped address */
     uint16_t        port;               /* Port number */
     uint32_t        timestamp;          /* Last seen time */
+    uint8_t         fail_count;         /* Connection failure count */
+    uint8_t         reserved[3];        /* Padding for alignment */
 } ftc_netaddr_t;
 
 /*==============================================================================

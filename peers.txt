@@ -1,6 +1,0 @@
-# FTC Seed Nodes
-# Share this file with other users to bootstrap the network
-
-15.164.228.225:17319
-18.194.233.15:17319
-107.21.36.212:17319

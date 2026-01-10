@@ -11,6 +11,9 @@
 #include <string.h>
 #include <stdio.h>
 
+/* Silent logging - no output */
+#define log_p2pool(...) ((void)0)
+
 /*==============================================================================
  * PPLNS IMPLEMENTATION
  *============================================================================*/
@@ -158,7 +161,7 @@ ftc_p2pool_t* ftc_p2pool_new(void* node)
 
     memset(p2pool->best_share, 0, sizeof(p2pool->best_share));
 
-    printf("[P2POOL] Initialized - PPLNS window: %d shares, min payout: %.4f FTC\n",
+    log_p2pool("[P2POOL] Initialized - PPLNS window: %d shares, min payout: %.4f FTC\n",
            p2pool->pplns_window, (double)p2pool->min_payout / 100000000.0);
 
     return p2pool;
@@ -273,7 +276,7 @@ void ftc_p2pool_add_share(ftc_p2pool_t* p2pool, const ftc_share_t* share)
     p2pool->share_height++;
     p2pool->total_shares++;
 
-    printf("[P2POOL] Share from %s (total: %llu, miners: %d)\n",
+    log_p2pool("[P2POOL] Share from %s (total: %llu, miners: %d)\n",
            share->miner_address,
            (unsigned long long)p2pool->total_shares,
            p2pool->pplns->miner_count);
@@ -321,7 +324,7 @@ bool ftc_p2pool_submit_share(ftc_p2pool_t* p2pool,
     }
 
     if (is_block) {
-        printf("[P2POOL] *** BLOCK FOUND by %s at height %u! ***\n",
+        log_p2pool("[P2POOL] *** BLOCK FOUND by %s at height %u! ***\n",
                miner_address, height);
         p2pool->blocks_found++;
     }
@@ -397,7 +400,7 @@ ftc_tx_t* ftc_p2pool_create_coinbase(ftc_p2pool_t* p2pool,
     ftc_payout_t* payouts = ftc_p2pool_get_payouts(p2pool, total_reward, &payout_count);
 
     if (payout_count == 0) {
-        printf("[P2POOL] Warning: No miners to pay, using fallback\n");
+        log_p2pool("[P2POOL] Warning: No miners to pay, using fallback\n");
         free(payouts);
         return NULL;
     }
@@ -427,13 +430,13 @@ ftc_tx_t* ftc_p2pool_create_coinbase(ftc_p2pool_t* p2pool,
 
     /* Verify we added at least one output */
     if (tx->output_count == 0) {
-        printf("[P2POOL] Error: Failed to add any outputs\n");
+        log_p2pool("[P2POOL] Error: Failed to add any outputs\n");
         ftc_tx_free(tx);
         free(payouts);
         return NULL;
     }
 
-    printf("[P2POOL] Created coinbase with %d outputs (reward: %.4f FTC)\n",
+    log_p2pool("[P2POOL] Created coinbase with %d outputs (reward: %.4f FTC)\n",
            tx->output_count, (double)total_reward / 100000000.0);
 
     free(payouts);

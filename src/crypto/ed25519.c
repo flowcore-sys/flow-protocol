@@ -22,7 +22,8 @@ void randombytes(unsigned char *x, unsigned long long xlen) {
 void randombytes(unsigned char *x, unsigned long long xlen) {
     int fd = open("/dev/urandom", O_RDONLY);
     if (fd >= 0) {
-        read(fd, x, xlen);
+        ssize_t n = read(fd, x, xlen);
+        (void)n;  /* Ignore return - best effort randomness */
         close(fd);
     }
 }

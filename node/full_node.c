@@ -18,6 +18,9 @@
 #include <unistd.h>
 #endif
 
+/* Silent logging - no output */
+#define log_node(...) ((void)0)
+
 /*==============================================================================
  * GLOBALS
  *============================================================================*/
@@ -27,7 +30,6 @@ static volatile bool g_shutdown_requested = false;
 static void signal_handler(int sig)
 {
     (void)sig;
-    printf("\n[NODE] Shutdown requested...\n");
     g_shutdown_requested = true;
 }
 
@@ -162,7 +164,7 @@ static bool ftc_chain_save(ftc_chain_t* chain, const char* path)
 
     /* Don't overwrite file if we have fewer blocks than originally loaded */
     if (chain->loaded_block_count > 0 && count < chain->loaded_block_count) {
-        printf("[NODE] Skipping save: have %u blocks but file had %u\n",
+        log_node("[NODE] Skipping save: have %u blocks but file had %u\n",
                count, chain->loaded_block_count);
         FTC_MUTEX_UNLOCK(chain->mutex);
         return false;
@@ -174,7 +176,7 @@ static bool ftc_chain_save(ftc_chain_t* chain, const char* path)
 
     FILE* f = fopen(temp_path, "wb");
     if (!f) {
-        printf("[NODE] Failed to open %s for writing\n", temp_path);
+        log_node("[NODE] Failed to open %s for writing\n", temp_path);
         FTC_MUTEX_UNLOCK(chain->mutex);
         return false;
     }
@@ -222,7 +224,7 @@ static bool ftc_chain_save(ftc_chain_t* chain, const char* path)
     /* Atomic rename: remove old file and rename temp */
     remove(path);
     if (rename(temp_path, path) != 0) {
-        printf("[NODE] Failed to rename %s to %s\n", temp_path, path);
+        log_node("[NODE] Failed to rename %s to %s\n", temp_path, path);
         return false;
     }
 
@@ -245,19 +247,19 @@ static int ftc_chain_load(ftc_node_t* node, const char* path)
     /* Read header */
     uint32_t magic, version, count;
     if (fread(&magic, 4, 1, f) != 1 || magic != FTC_BLOCKS_MAGIC) {
-        printf("[NODE] Invalid blocks.dat magic\n");
+        log_node("[NODE] Invalid blocks.dat magic\n");
         fclose(f);
         return -1;
     }
 
     if (fread(&version, 4, 1, f) != 1 || version != FTC_BLOCKS_VERSION) {
-        printf("[NODE] Unsupported blocks.dat version\n");
+        log_node("[NODE] Unsupported blocks.dat version\n");
         fclose(f);
         return -1;
     }
 
     if (fread(&count, 4, 1, f) != 1) {
-        printf("[NODE] Failed to read block count\n");
+        log_node("[NODE] Failed to read block count\n");
         fclose(f);
         return -1;
     }
@@ -270,18 +272,18 @@ static int ftc_chain_load(ftc_node_t* node, const char* path)
     for (uint32_t i = 1; i < count; i++) {
         uint32_t size32;
         if (fread(&size32, 4, 1, f) != 1) {
-            printf("[NODE] Failed to read block %u size\n", i);
+            log_node("[NODE] Failed to read block %u size\n", i);
             break;
         }
 
         uint8_t* block_data = (uint8_t*)malloc(size32);
         if (!block_data) {
-            printf("[NODE] Out of memory loading block %u\n", i);
+            log_node("[NODE] Out of memory loading block %u\n", i);
             break;
         }
 
         if (fread(block_data, 1, size32, f) != size32) {
-            printf("[NODE] Failed to read block %u data\n", i);
+            log_node("[NODE] Failed to read block %u data\n", i);
             free(block_data);
             break;
         }
@@ -290,7 +292,7 @@ static int ftc_chain_load(ftc_node_t* node, const char* path)
         free(block_data);
 
         if (!block) {
-            printf("[NODE] Failed to deserialize block %u\n", i);
+            log_node("[NODE] Failed to deserialize block %u\n", i);
             break;
         }
 
@@ -353,7 +355,7 @@ static int ftc_chain_load(ftc_node_t* node, const char* path)
                 ftc_block_hash(block, hash);
                 char hex[65];
                 ftc_hash_to_hex(hash, hex);
-                printf("[NODE] Block %u rejected: %s\n", i, hex);
+                log_node("[NODE] Block %u rejected: %s\n", i, hex);
             }
         }
 
@@ -369,9 +371,9 @@ static int ftc_chain_load(ftc_node_t* node, const char* path)
            to allow saving the blockchain */
         node->chain->loaded_block_count = loaded + 1;  /* +1 for genesis */
         if (node->config.recovery_mode) {
-            printf("[NODE] RECOVERY: Loaded %d blocks (was %u in file)\n", loaded, count);
+            log_node("[NODE] RECOVERY: Loaded %d blocks (was %u in file)\n", loaded, count);
         } else if (used_checkpoint) {
-            printf("[NODE] Loaded %d blocks using checkpoint\n", loaded);
+            log_node("[NODE] Loaded %d blocks using checkpoint\n", loaded);
         }
     } else {
         node->chain->loaded_block_count = count;
@@ -464,7 +466,7 @@ bool ftc_chain_add_block(ftc_node_t* node, ftc_block_t* block)
 
     /* Expand if needed */
     if (chain->block_count >= chain->block_capacity && !expand_block_array(chain)) {
-        printf("[NODE] Failed to expand block storage\n");
+        log_node("[NODE] Failed to expand block storage\n");
         FTC_MUTEX_UNLOCK(chain->mutex);
         ftc_block_free(block_copy);
         return false;
@@ -584,7 +586,7 @@ bool ftc_node_validate_block(ftc_node_t* node, const ftc_block_t* block)
     }
 
     if (!valid_pow) {
-        printf("[NODE] Block fails PoW check\n");
+        log_node("[NODE] Block fails PoW check\n");
         return false;
     }
 
@@ -592,26 +594,26 @@ bool ftc_node_validate_block(ftc_node_t* node, const ftc_block_t* block)
     ftc_hash256_t merkle;
     ftc_block_merkle_root(block, merkle);
     if (memcmp(merkle, block->header.merkle_root, 32) != 0) {
-        printf("[NODE] Block has wrong merkle root\n");
+        log_node("[NODE] Block has wrong merkle root\n");
         return false;
     }
 
     /* Check timestamp */
     int64_t now = time(NULL);
     if (block->header.timestamp > now + 7200) {  /* 2 hours in future */
-        printf("[NODE] Block timestamp too far in future\n");
+        log_node("[NODE] Block timestamp too far in future\n");
         return false;
     }
 
     /* Check transactions */
     if (block->tx_count == 0) {
-        printf("[NODE] Block has no transactions\n");
+        log_node("[NODE] Block has no transactions\n");
         return false;
     }
 
     /* First tx must be coinbase */
     if (!ftc_tx_is_coinbase(block->txs[0])) {
-        printf("[NODE] First tx is not coinbase\n");
+        log_node("[NODE] First tx is not coinbase\n");
         return false;
     }
 
@@ -638,7 +640,7 @@ bool ftc_node_validate_block(ftc_node_t* node, const ftc_block_t* block)
     }
 
     if (block->txs[0]->outputs[0].value > reward + fees) {
-        printf("[NODE] Coinbase reward too high\n");
+        log_node("[NODE] Coinbase reward too high\n");
         return false;
     }
 
@@ -789,7 +791,7 @@ ftc_block_t* ftc_node_create_block_template(ftc_node_t* node, const ftc_address_
         /* Log LWMA adjustment periodically */
         if (height % 100 == 0) {
             double diff = ftc_bits_to_difficulty(block->header.bits);
-            printf("[NODE] LWMA difficulty at height %u: %.2f (bits=0x%08x)\n",
+            log_node("[NODE] LWMA difficulty at height %u: %.2f (bits=0x%08x)\n",
                    height, diff, block->header.bits);
         }
     } else if (height % FTC_DIFFICULTY_INTERVAL != 0) {
@@ -844,7 +846,7 @@ ftc_block_t* ftc_node_create_block_template(ftc_node_t* node, const ftc_address_
         }
 
         block->header.bits = ftc_target_to_bits(target);
-        printf("[NODE] Legacy difficulty adjusted at height %u: bits=0x%08x\n", height, block->header.bits);
+        log_node("[NODE] Legacy difficulty adjusted at height %u: bits=0x%08x\n", height, block->header.bits);
     }
 
     /* Emergency Difficulty Adjustment (EDA) - only for pre-LWMA heights */
@@ -871,7 +873,7 @@ ftc_block_t* ftc_node_create_block_template(ftc_node_t* node, const ftc_address_
             }
 
             block->header.bits = ftc_target_to_bits(eda_target);
-            printf("[NODE] EDA: %d min since last block, difficulty reduced %dx (bits=0x%08x)\n",
+            log_node("[NODE] EDA: %d min since last block, difficulty reduced %dx (bits=0x%08x)\n",
                    time_since_last / 60, 1 << eda_multiplier, block->header.bits);
         }
     }
@@ -1198,7 +1200,7 @@ void ftc_node_config_default(ftc_node_config_t* config)
     config->p2p_port = FTC_MAINNET_PORT;
     config->stratum_port = STRATUM_DEFAULT_PORT;  /* 3333 */
     config->listen = true;  /* Accept incoming P2P connections by default */
-    config->stratum_enabled = false;  /* Stratum disabled by default */
+    config->stratum_enabled = true;   /* Stratum enabled by default */
     strcpy(config->data_dir, FTC_DATA_DIR);
     config->wallet_enabled = true;
     config->log_level = 1;
@@ -1264,17 +1266,11 @@ ftc_node_t* ftc_node_new(const ftc_node_config_t* config)
 
     /* Create P2Pool for decentralized mining */
     node->p2pool = ftc_p2pool_new(node);
-    if (node->p2pool) {
-        printf("[NODE] P2Pool initialized - decentralized mining enabled\n");
-    }
 
     /* Create Stratum server if enabled */
     if (config->stratum_enabled) {
         uint16_t stratum_port = config->stratum_port ? config->stratum_port : STRATUM_DEFAULT_PORT;
         node->stratum = ftc_stratum_new(node, stratum_port);
-        if (node->stratum) {
-            printf("[NODE] Stratum server created on port %u\n", stratum_port);
-        }
     }
 
     return node;
@@ -1322,7 +1318,7 @@ bool ftc_node_start(ftc_node_t* node)
 
     /* Initialize chain */
     if (!ftc_chain_init(node->chain)) {
-        printf("[NODE] Failed to initialize chain\n");
+        log_node("[NODE] Failed to initialize chain\n");
         return false;
     }
 
@@ -1335,11 +1331,11 @@ bool ftc_node_start(ftc_node_t* node)
     bool should_save = node->config.recovery_mode ||
                        (node->chain->block_count > 2015);  /* Used checkpoint loading */
     if (should_save && node->chain->block_count > 1) {
-        printf("[NODE] Saving blockchain (%d blocks)...\n", node->chain->block_count);
+        log_node("[NODE] Saving blockchain (%d blocks)...\n", node->chain->block_count);
         if (ftc_chain_save(node->chain, blocks_path)) {
-            printf("[NODE] Blockchain saved successfully!\n");
+            log_node("[NODE] Blockchain saved successfully!\n");
         } else {
-            printf("[NODE] WARNING - Failed to save blockchain!\n");
+            log_node("[NODE] WARNING - Failed to save blockchain!\n");
         }
     }
 
@@ -1372,16 +1368,11 @@ bool ftc_node_start(ftc_node_t* node)
     ftc_rpc_set_handlers(node->rpc, &rpc_handlers);
 
     /* Start RPC */
-    if (!ftc_rpc_start(node->rpc, node->config.rpc_port)) {
-        printf("[NODE] Failed to start RPC\n");
-    }
+    ftc_rpc_start(node->rpc, node->config.rpc_port);
 
     /* Start P2P network */
     if (node->p2p) {
         if (ftc_p2p_start(node->p2p)) {
-            printf("[NODE] P2P network started on port %d\n",
-                   node->config.p2p_port ? node->config.p2p_port : FTC_MAINNET_PORT);
-
             /* Connect to manually specified nodes (-addnode / -peers) */
             for (int i = 0; i < node->config.connect_node_count; i++) {
                 const char* addr = node->config.connect_nodes[i];
@@ -1397,7 +1388,6 @@ bool ftc_node_start(ftc_node_t* node)
                     port = (uint16_t)atoi(colon + 1);
                 }
 
-                printf("[NODE] Connecting to %s:%d...\n", host, port);
                 ftc_p2p_connect(node->p2p, host, port);
             }
         }
@@ -1405,12 +1395,7 @@ bool ftc_node_start(ftc_node_t* node)
 
     /* Start Stratum server if enabled */
     if (node->stratum) {
-        if (ftc_stratum_start(node->stratum)) {
-            printf("[NODE] Stratum pool server started on port %d\n",
-                   node->config.stratum_port ? node->config.stratum_port : STRATUM_DEFAULT_PORT);
-        } else {
-            printf("[NODE] WARNING: Failed to start Stratum server\n");
-        }
+        ftc_stratum_start(node->stratum);
     }
 
     node->running = true;
@@ -1420,8 +1405,6 @@ bool ftc_node_start(ftc_node_t* node)
 void ftc_node_stop(ftc_node_t* node)
 {
     if (!node->running) return;
-
-    printf("Saving blockchain and stopping...\n");
 
     /* Stop Stratum server */
     if (node->stratum) {
@@ -1467,84 +1450,8 @@ void ftc_node_poll(ftc_node_t* node)
 }
 
 /*==============================================================================
- * DASHBOARD
+ * NODE RUN LOOP (Background daemon mode)
  *============================================================================*/
-
-static void enable_virtual_terminal(void)
-{
-#ifdef _WIN32
-    HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
-    DWORD dwMode = 0;
-    GetConsoleMode(hOut, &dwMode);
-    dwMode |= 0x0004;  /* ENABLE_VIRTUAL_TERMINAL_PROCESSING */
-    SetConsoleMode(hOut, dwMode);
-#endif
-}
-
-static void print_dashboard(ftc_node_t* node)
-{
-    int64_t now = time(NULL);
-    int64_t uptime = now - node->start_time;
-
-    /* Format uptime */
-    int days = (int)(uptime / 86400);
-    int hours = (int)((uptime % 86400) / 3600);
-    int mins = (int)((uptime % 3600) / 60);
-    int secs = (int)(uptime % 60);
-
-    /* Format best hash (last 16 chars) */
-    char hash_short[17];
-    char hash_hex[65];
-    ftc_hash_to_hex(node->chain->best_hash, hash_hex);
-    strncpy(hash_short, hash_hex + 48, 16);
-    hash_short[16] = '\0';
-
-    /* Calculate blocks/min */
-    float blocks_per_min = 0;
-    if (uptime > 0) {
-        blocks_per_min = (float)node->blocks_received * 60.0f / (float)uptime;
-    }
-
-    /* Time since last block */
-    int64_t since_block = node->last_block_time > 0 ? (now - node->last_block_time) : 0;
-
-    /* Move cursor to home and clear screen */
-    printf("\033[H\033[J");
-
-    /* Get active miners count (RPC + Stratum) */
-    int active_miners = ftc_rpc_get_active_miners(node->rpc);
-    if (node->stratum) {
-        active_miners += ftc_stratum_get_miner_count(node->stratum);
-    }
-
-    /* Print dashboard */
-    printf("+--------------------------------------------------------------+\n");
-    printf("|        FTC Central Server v%-10s                       |\n", FTC_NODE_VERSION);
-    printf("+--------------------------------------------------------------+\n");
-
-    printf("|  Height:    %-10u          Miners:    %-3d active       |\n",
-           node->chain->best_height, active_miners);
-    printf("|  Best:      ...%-16s                                |\n",
-           hash_short);
-    printf("|  Mempool:   %-10zu tx                                    |\n",
-           ftc_mempool_count(node->mempool));
-
-    printf("+--------------------------------------------------------------+\n");
-    printf("|  Uptime:    %dd %02dh %02dm %02ds                                  |\n",
-           days, hours, mins, secs);
-    printf("|  Blocks:    %-6u received     (%.1f/min)                   |\n",
-           node->blocks_received, blocks_per_min);
-    printf("|  Last:      %-6lld sec ago                                   |\n",
-           (long long)since_block);
-    printf("+--------------------------------------------------------------+\n");
-
-    printf("|  RPC Port:  %-5u                                            |\n",
-           node->config.rpc_port);
-    printf("+--------------------------------------------------------------+\n");
-    printf("\n  Press Ctrl+C to stop\n");
-
-    fflush(stdout);
-}
 
 void ftc_node_run(ftc_node_t* node)
 {
@@ -1553,28 +1460,21 @@ void ftc_node_run(ftc_node_t* node)
     signal(SIGTERM, signal_handler);
 #endif
 
-    /* Enable ANSI escape codes on Windows */
-    enable_virtual_terminal();
+    printf("FTC Node v%s running. Press Ctrl+C to stop.\n", FTC_NODE_VERSION);
+    fflush(stdout);
 
-    /* Initial dashboard */
     node->prev_height = node->chain->best_height;
-    print_dashboard(node);
 
+    /* Silent background loop */
     while (node->running && !g_shutdown_requested) {
         ftc_node_poll(node);
 
-        /* Update dashboard every second */
-        int64_t now = time(NULL);
-        if (now - node->last_dashboard_update >= 1) {
-            /* Track blocks received */
-            if (node->chain->best_height > node->prev_height) {
-                node->blocks_received += (node->chain->best_height - node->prev_height);
-                node->last_block_time = now;
-                node->prev_height = node->chain->best_height;
-            }
-
-            print_dashboard(node);
-            node->last_dashboard_update = now;
+        /* Track new blocks */
+        if (node->chain->best_height > node->prev_height) {
+            uint32_t new_blocks = node->chain->best_height - node->prev_height;
+            node->blocks_received += new_blocks;
+            node->last_block_time = time(NULL);
+            node->prev_height = node->chain->best_height;
         }
 
 #ifdef _WIN32
@@ -1584,7 +1484,5 @@ void ftc_node_run(ftc_node_t* node)
 #endif
     }
 
-    /* Clear screen before shutdown message */
-    printf("\033[H\033[J");
     ftc_node_stop(node);
 }

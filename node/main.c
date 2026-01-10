@@ -10,12 +10,15 @@
  *   -addnode <ip:port> Add peer to connect to
  *   -peers <file>      Load peers from file
  *   -bootstrap <url>   Download blocks.dat from URL
+ *   -genaddress        Generate new wallet address
  *   -nowallet          Disable wallet
  *   -recover           Recovery mode
  *   -help              Show help
  */
 
 #include "full_node.h"
+#include "../src/wallet/wallet.h"
+#include "../src/crypto/keys.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -205,27 +208,51 @@ static bool download_blocks_dat(const char* url, const char* dest_path)
         fwrite(header_end, 1, body_in_buffer, f);
     }
 
-    /* Stream rest of file */
+    /* Stream rest of file with visual progress */
     long received = body_in_buffer;
-    int last_percent = 0;
+    int last_percent = -1;
+    time_t start_time = time(NULL);
 
+    printf("\n");
     while (content_length == 0 || received < content_length) {
         int ret = recv(sock, buffer, sizeof(buffer), 0);
         if (ret <= 0) break;
         fwrite(buffer, 1, ret, f);
         received += ret;
 
-        /* Show progress */
+        /* Show visual progress bar */
         if (content_length > 0) {
             int percent = (int)(received * 100 / content_length);
             if (percent != last_percent) {
-                printf("\rDownloading: %d%% (%ld / %ld bytes)", percent, received, content_length);
+                /* Calculate speed */
+                time_t elapsed = time(NULL) - start_time;
+                double speed = (elapsed > 0) ? (received / 1024.0 / 1024.0) / elapsed : 0;
+
+                /* Progress bar */
+                int bar_width = 40;
+                int filled = (percent * bar_width) / 100;
+
+                printf("\r  [");
+                for (int i = 0; i < bar_width; i++) {
+                    if (i < filled) printf("=");
+                    else if (i == filled) printf(">");
+                    else printf(" ");
+                }
+                printf("] %3d%% %.1f/%.1f MB (%.2f MB/s)",
+                       percent,
+                       received / 1024.0 / 1024.0,
+                       content_length / 1024.0 / 1024.0,
+                       speed);
                 fflush(stdout);
                 last_percent = percent;
             }
+        } else {
+            /* Unknown size - just show received */
+            printf("\r  Downloading: %.2f MB...", received / 1024.0 / 1024.0);
+            fflush(stdout);
         }
     }
-    printf("\n");
+    printf("\n\n");
 
     fclose(f);
 #ifdef _WIN32
@@ -234,8 +261,73 @@ static bool download_blocks_dat(const char* url, const char* dest_path)
     close(sock);
 #endif
 
-    printf("Downloaded %ld bytes to %s\n", received, dest_path);
+    printf("  Bootstrap complete: %.2f MB downloaded\n", received / 1024.0 / 1024.0);
     return received > 0;
+}
+
+/*==============================================================================
+ * WALLET GENERATION
+ *============================================================================*/
+
+static int generate_address(const char* data_dir)
+{
+    /* Ensure data directory exists */
+    mkdir(data_dir, 0755);
+
+    char wallet_path[512];
+    snprintf(wallet_path, sizeof(wallet_path), "%s/wallet.dat", data_dir);
+
+    /* Check if wallet already exists */
+    ftc_wallet_t* wallet = ftc_wallet_load(wallet_path);
+    if (wallet) {
+        printf("Wallet already exists at %s\n", wallet_path);
+        printf("Existing addresses:\n\n");
+
+        for (int i = 0; i < wallet->key_count; i++) {
+            char addr_str[64];
+            ftc_address_encode(wallet->keys[i].address, true, addr_str);
+            printf("  Address %d: %s\n", i + 1, addr_str);
+        }
+
+        printf("\nGenerating new address...\n\n");
+    } else {
+        wallet = ftc_wallet_new();
+        if (!wallet) {
+            printf("Failed to create wallet\n");
+            return 1;
+        }
+        printf("Creating new wallet at %s\n\n", wallet_path);
+    }
+
+    /* Generate new key */
+    ftc_wallet_key_t* key = ftc_wallet_new_key(wallet, "Generated");
+    if (!key) {
+        printf("Failed to generate key\n");
+        ftc_wallet_free(wallet);
+        return 1;
+    }
+
+    /* Get address string */
+    char addr_str[64];
+    ftc_address_encode(key->address, true, addr_str);
+
+    /* Get WIF private key */
+    char wif[64];
+    ftc_privkey_to_wif(key->privkey, true, wif);
+
+    /* Save wallet */
+    if (!ftc_wallet_save(wallet, wallet_path)) {
+        printf("Warning: Failed to save wallet\n");
+    }
+
+    printf("=== New FTC Address Generated ===\n\n");
+    printf("  Address:     %s\n", addr_str);
+    printf("  Private Key: %s\n\n", wif);
+    printf("IMPORTANT: Save your private key! It cannot be recovered.\n");
+    printf("Wallet saved to: %s\n\n", wallet_path);
+
+    ftc_wallet_free(wallet);
+    return 0;
 }
 
 /*==============================================================================
@@ -255,6 +347,7 @@ static void print_help(void)
     printf("  -addnode <ip:port> Add a peer to connect to (can use multiple times)\n");
     printf("  -peers <file>      Load peers from text file (one per line)\n");
     printf("  -bootstrap <url>   Download blocks.dat from node URL\n");
+    printf("  -genaddress        Generate new wallet address and exit\n");
     printf("  -nowallet          Disable wallet\n");
     printf("  -recover           Recovery mode: skip validation when loading blocks\n");
     printf("  -help              Show this help\n");
@@ -263,6 +356,7 @@ static void print_help(void)
     printf("  ftc-node -addnode 15.164.228.225:17317\n");
     printf("  ftc-node -bootstrap http://15.164.228.225:17318/blocks.dat\n");
     printf("  ftc-node -datadir /var/ftc -stratum\n");
+    printf("  ftc-node -genaddress\n");
     printf("\n");
 }
 
@@ -272,12 +366,16 @@ int main(int argc, char* argv[])
     ftc_node_config_default(&config);
 
     const char* bootstrap_url = NULL;
+    bool do_genaddress = false;
 
     /* Parse arguments */
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-help") == 0 || strcmp(argv[i], "--help") == 0) {
             print_help();
             return 0;
+        }
+        else if (strcmp(argv[i], "-genaddress") == 0) {
+            do_genaddress = true;
         }
         else if (strcmp(argv[i], "-rpcport") == 0 && i + 1 < argc) {
             config.rpc_port = (uint16_t)atoi(argv[++i]);
@@ -339,6 +437,11 @@ int main(int argc, char* argv[])
 
     /* Create data directory */
     mkdir(config.data_dir, 0755);
+
+    /* Generate address and exit if requested */
+    if (do_genaddress) {
+        return generate_address(config.data_dir);
+    }
 
     /* Bootstrap: download blocks.dat from another node if requested */
     if (bootstrap_url) {

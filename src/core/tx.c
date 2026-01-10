@@ -10,11 +10,19 @@
 #include <string.h>
 #include <stdio.h>
 
+/* Cross-platform unused attribute */
+#ifdef _MSC_VER
+#define MAYBE_UNUSED
+#else
+#define MAYBE_UNUSED __attribute__((unused))
+#endif
+
 /*==============================================================================
  * COINBASE CONSTANTS
  *============================================================================*/
 
 /* Coinbase input marker: all zeros */
+MAYBE_UNUSED
 static const ftc_hash256_t COINBASE_TXID = {0};
 #define COINBASE_VOUT 0xffffffff
 

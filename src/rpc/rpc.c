@@ -26,6 +26,13 @@
 #define FTC_RPC_INVALID_SOCKET -1
 #endif
 
+/* Cross-platform unused attribute */
+#ifdef _MSC_VER
+#define MAYBE_UNUSED
+#else
+#define MAYBE_UNUSED __attribute__((unused))
+#endif
+
 /*==============================================================================
  * PLATFORM UTILITIES
  *============================================================================*/
@@ -403,6 +410,7 @@ ftc_rpc_server_t* ftc_rpc_new(void)
 }
 
 /* Grow client array when needed */
+MAYBE_UNUSED
 static bool rpc_grow_clients(ftc_rpc_server_t* rpc)
 {
     int new_capacity = rpc->client_capacity * 2;
@@ -718,6 +726,7 @@ static void rpc_getpeercount(ftc_rpc_server_t* rpc, ftc_json_t* json, const char
     ftc_json_object_end(json);
 }
 
+MAYBE_UNUSED
 static void rpc_getconnectioncount(ftc_rpc_server_t* rpc, ftc_json_t* json, const char* id)
 {
     int count = 0;

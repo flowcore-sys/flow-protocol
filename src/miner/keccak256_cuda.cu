@@ -236,14 +236,15 @@ __global__ void keccak256_mine_kernel(
         keccak256_80((uint8_t*)local_header_u64, (uint8_t*)hash1_u64);
         keccak256_32((uint8_t*)hash1_u64, (uint8_t*)hash2_u64);
 
-        /* Compare with target (big-endian comparison from MSB) */
+        /* Compare with target (big-endian: byte 31 is MSB, compare from MSB down) */
+        /* Must match server-side comparison in stratum.c */
+        /* Use subtraction to avoid CUDA compiler issues with "h < 0" optimization */
         uint8_t* hash2 = (uint8_t*)hash2_u64;
-        bool valid = true;
-        #pragma unroll
-        for (int i = 31; i >= 0; i--) {
-            if (hash2[i] < target[i]) break;
-            if (hash2[i] > target[i]) { valid = false; break; }
+        int cmp = 0;
+        for (int i = 31; i >= 0 && cmp == 0; i--) {
+            cmp = (int)hash2[i] - (int)target[i];
         }
+        bool valid = (cmp <= 0);  /* hash <= target */
 
         if (valid) {
             if (atomicCAS(found, 0, 1) == 0) {
@@ -480,6 +481,12 @@ extern "C" void ftc_gpu_launch_cuda(ftc_gpu_ctx_t* ctx, uint32_t nonce_start)
         ctx->d_result_hash,
         ctx->d_found
     );
+
+    /* Check for kernel launch errors */
+    cudaError_t launch_err = cudaGetLastError();
+    if (launch_err != cudaSuccess) {
+        fprintf(stderr, "CUDA kernel launch error: %s\n", cudaGetErrorString(launch_err));
+    }
 
     /* Stop timing event (will be recorded when kernel completes) */
     cudaEventRecord(ctx->stop_event, ctx->stream);

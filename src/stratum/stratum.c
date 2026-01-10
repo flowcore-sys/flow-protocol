@@ -30,6 +30,16 @@
 #define WOULD_BLOCK (errno == EAGAIN || errno == EWOULDBLOCK)
 #endif
 
+/* Cross-platform unused attribute */
+#ifdef _MSC_VER
+#define MAYBE_UNUSED
+#else
+#define MAYBE_UNUSED __attribute__((unused))
+#endif
+
+/* Silent logging - no output */
+#define log_stratum(...) ((void)0)
+
 /* Forward declarations */
 static void stratum_create_job(ftc_stratum_t* stratum);
 
@@ -47,6 +57,7 @@ static void bytes_to_hex(const uint8_t* bytes, size_t len, char* out)
     out[len * 2] = '\0';
 }
 
+MAYBE_UNUSED
 static void hex_to_bytes(const char* hex, uint8_t* out, size_t len)
 {
     for (size_t i = 0; i < len; i++) {
@@ -56,6 +67,7 @@ static void hex_to_bytes(const char* hex, uint8_t* out, size_t len)
     }
 }
 
+MAYBE_UNUSED
 static void bytes_to_hex_reverse(const uint8_t* bytes, size_t len, char* out)
 {
     static const char hex[] = "0123456789abcdef";
@@ -206,14 +218,12 @@ static void stratum_handle_subscribe(ftc_stratum_t* stratum, stratum_client_t* c
 
     stratum_send_result(client, id, result);
 
-    printf("[STRATUM] Client %u subscribed (%s) extranonce1=%s\n",
+    log_stratum("[STRATUM] Client %u subscribed (%s) extranonce1=%s\n",
            client->id, client->user_agent, client->extranonce1_hex);
 }
 
 static void stratum_handle_authorize(ftc_stratum_t* stratum, stratum_client_t* client, int id, const char* params)
 {
-    (void)stratum;
-
     /* Parse worker name (address) from params */
     if (params) {
         const char* worker_start = strchr(params, '"');
@@ -245,18 +255,34 @@ static void stratum_handle_authorize(ftc_stratum_t* stratum, stratum_client_t* c
     /* Validate address format (basic check) */
     size_t addr_len = strlen(client->miner_address);
     if (addr_len >= 26 && addr_len <= 62) {
+        /* Kick any existing connections with the same miner address (reconnecting miner) */
+        for (int i = 0; i < STRATUM_MAX_CLIENTS; i++) {
+            stratum_client_t* other = stratum->clients[i];
+            if (other && other != client && other->state == STRATUM_CLIENT_AUTHORIZED) {
+                /* Check for same miner address (same miner reconnecting) */
+                if (strcmp(other->miner_address, client->miner_address) == 0) {
+                    log_stratum("[STRATUM] Kicking old connection %u (same address)\n", other->id);
+                    close_socket(other->socket);
+                    other->socket = STRATUM_INVALID_SOCKET;
+                    client_free(other);
+                    stratum->clients[i] = NULL;
+                    stratum->client_count--;
+                }
+            }
+        }
+
         client->state = STRATUM_CLIENT_AUTHORIZED;
         stratum_send_result(client, id, "true");
-        printf("[STRATUM] Client %u authorized as %s\n", client->id, client->miner_address);
+        log_stratum("[STRATUM] Client %u authorized as %s\n", client->id, client->miner_address);
 
         /* If no block template yet (first miner), create job now */
         if (!stratum->current_job.block_template) {
-            printf("[STRATUM] First miner connected, creating job...\n");
+            log_stratum("[STRATUM] First miner connected, creating job...\n");
             stratum_create_job(stratum);
         }
     } else {
         stratum_send_error(client, id, 20, "Invalid worker address");
-        printf("[STRATUM] Client %u authorization failed: invalid address '%s'\n",
+        log_stratum("[STRATUM] Client %u authorization failed: invalid address '%s'\n",
                client->id, client->miner_address);
     }
 }
@@ -276,7 +302,7 @@ static void stratum_send_job(ftc_stratum_t* stratum, stratum_client_t* client, b
 {
     stratum_job_t* job = &stratum->current_job;
     if (!job->block_template) {
-        printf("[STRATUM] Cannot send job - no block template\n");
+        log_stratum("[STRATUM] Cannot send job - no block template\n");
         return;
     }
 
@@ -306,7 +332,7 @@ static void stratum_send_job(ftc_stratum_t* stratum, stratum_client_t* client, b
 
     client_send(client, msg);
     snprintf(client->current_job_id, sizeof(client->current_job_id), "%s", job->job_id);
-    printf("[STRATUM] Sent job %s to client %u\n", job->job_id, client->id);
+    log_stratum("[STRATUM] Sent job %s to client %u\n", job->job_id, client->id);
 }
 
 static void stratum_handle_submit(ftc_stratum_t* stratum, stratum_client_t* client, int id, const char* params)
@@ -389,18 +415,23 @@ static void stratum_handle_submit(ftc_stratum_t* stratum, stratum_client_t* clie
     ftc_keccak256_double(header, 80, hash);
 
     /* Calculate share target from pool difficulty */
+    /* Base diff 1 target = 0x0fffff at bytes 27-29 (from 0x1e0fffff) */
+    /* Higher difficulty = smaller target (divide base by difficulty) */
     ftc_hash256_t share_target;
-    ftc_bits_to_target(0x1e0fffff, share_target);  /* Base diff 1 */
+    memset(share_target, 0xff, 32);  /* Bytes 0-26 = 0xff (always pass) */
 
-    /* Scale target by difficulty (higher diff = lower target) */
-    if (client->difficulty > 1.0) {
-        /* Simple scaling - divide target by difficulty */
-        double scale = 1.0 / client->difficulty;
-        uint64_t* t64 = (uint64_t*)share_target;
-        for (int i = 0; i < 4; i++) {
-            t64[i] = (uint64_t)(t64[i] * scale);
-        }
-    }
+    double diff = client->difficulty;
+    if (diff < 1.0) diff = 1.0;
+
+    uint64_t base_target = 0x0fffffULL;
+    uint64_t scaled_target = (uint64_t)(base_target / diff);
+
+    /* Store in little-endian at bytes 27-31 (comparison goes 31->0) */
+    share_target[27] = (uint8_t)(scaled_target & 0xff);
+    share_target[28] = (uint8_t)((scaled_target >> 8) & 0xff);
+    share_target[29] = (uint8_t)((scaled_target >> 16) & 0xff);
+    share_target[30] = (uint8_t)((scaled_target >> 24) & 0xff);
+    share_target[31] = 0x00;  /* MSB must be 0 */
 
     /* Check if hash meets share target */
     bool valid_share = true;
@@ -448,7 +479,7 @@ static void stratum_handle_submit(ftc_stratum_t* stratum, stratum_client_t* clie
         char hash_hex[65];
         bytes_to_hex(hash, 32, hash_hex);
 
-        printf("[STRATUM] *** BLOCK FOUND by %s! Hash: %s ***\n",
+        log_stratum("[STRATUM] *** BLOCK FOUND by %s! Hash: %s ***\n",
                client->miner_address, hash_hex);
 
         client->blocks_found++;
@@ -463,12 +494,12 @@ static void stratum_handle_submit(ftc_stratum_t* stratum, stratum_client_t* clie
 
             /* Submit to blockchain */
             if (ftc_node_submit_block(node, job->block_template)) {
-                printf("[STRATUM] Block submitted successfully!\n");
+                log_stratum("[STRATUM] Block submitted successfully!\n");
 
                 /* Broadcast new job */
                 ftc_stratum_notify_new_block(stratum);
             } else {
-                printf("[STRATUM] Block submission failed!\n");
+                log_stratum("[STRATUM] Block submission failed!\n");
             }
         }
     }
@@ -600,7 +631,7 @@ static void stratum_create_job(ftc_stratum_t* stratum)
                 /* Recalculate merkle root */
                 ftc_block_merkle_root(job->block_template, job->block_template->header.merkle_root);
 
-                printf("[STRATUM] P2Pool coinbase: %d miners will share reward\n",
+                log_stratum("[STRATUM] P2Pool coinbase: %d miners will share reward\n",
                        p2pool_coinbase->output_count);
             }
         }
@@ -613,7 +644,7 @@ static void stratum_create_job(ftc_stratum_t* stratum)
         job->nbits = tip->header.bits;
     }
 
-    printf("[STRATUM] New job %s at height %u (diff target: %08x)\n",
+    log_stratum("[STRATUM] New job %s at height %u (diff target: %08x)\n",
            job->job_id, job->height, job->nbits);
 }
 
@@ -637,7 +668,7 @@ ftc_stratum_t* ftc_stratum_new(struct ftc_node* node, uint16_t port)
     /* Create P2Pool for payout distribution */
     stratum->p2pool = ftc_p2pool_new(node);
 
-    printf("[STRATUM] Server created on port %u\n", stratum->port);
+    log_stratum("[STRATUM] Server created on port %u\n", stratum->port);
 
     return stratum;
 }
@@ -676,7 +707,7 @@ bool ftc_stratum_start(ftc_stratum_t* stratum)
 #ifdef _WIN32
     WSADATA wsa;
     if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
-        fprintf(stderr, "[STRATUM] WSAStartup failed\n");
+        log_stratum("[STRATUM] WSAStartup failed\n");
         return false;
     }
 #endif
@@ -684,7 +715,7 @@ bool ftc_stratum_start(ftc_stratum_t* stratum)
     /* Create listening socket */
     stratum->listen_socket = socket(AF_INET, SOCK_STREAM, 0);
     if (stratum->listen_socket == STRATUM_INVALID_SOCKET) {
-        fprintf(stderr, "[STRATUM] Failed to create socket\n");
+        log_stratum("[STRATUM] Failed to create socket\n");
         return false;
     }
 
@@ -699,14 +730,14 @@ bool ftc_stratum_start(ftc_stratum_t* stratum)
     addr.sin_port = htons(stratum->port);
 
     if (bind(stratum->listen_socket, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-        fprintf(stderr, "[STRATUM] Failed to bind to port %u\n", stratum->port);
+        log_stratum("[STRATUM] Failed to bind to port %u\n", stratum->port);
         close_socket(stratum->listen_socket);
         stratum->listen_socket = STRATUM_INVALID_SOCKET;
         return false;
     }
 
     if (listen(stratum->listen_socket, 32) < 0) {
-        fprintf(stderr, "[STRATUM] Failed to listen\n");
+        log_stratum("[STRATUM] Failed to listen\n");
         close_socket(stratum->listen_socket);
         stratum->listen_socket = STRATUM_INVALID_SOCKET;
         return false;
@@ -718,7 +749,7 @@ bool ftc_stratum_start(ftc_stratum_t* stratum)
     /* Create initial job */
     stratum_create_job(stratum);
 
-    printf("[STRATUM] Server started on port %u\n", stratum->port);
+    log_stratum("[STRATUM] Server started on port %u\n", stratum->port);
 
     return true;
 }
@@ -743,7 +774,7 @@ void ftc_stratum_stop(ftc_stratum_t* stratum)
         }
     }
 
-    printf("[STRATUM] Server stopped\n");
+    log_stratum("[STRATUM] Server stopped\n");
 }
 
 void ftc_stratum_poll(ftc_stratum_t* stratum)
@@ -779,7 +810,7 @@ void ftc_stratum_poll(ftc_stratum_t* stratum)
                 stratum->client_count++;
                 stratum->total_clients_connected++;
 
-                printf("[STRATUM] Client %u connected from %s:%d\n",
+                log_stratum("[STRATUM] Client %u connected from %s:%d\n",
                        client->id,
                        inet_ntoa(client_addr.sin_addr),
                        ntohs(client_addr.sin_port));
@@ -799,7 +830,7 @@ void ftc_stratum_poll(ftc_stratum_t* stratum)
 
         /* Check for timeout */
         if (now - client->last_activity > STRATUM_TIMEOUT) {
-            printf("[STRATUM] Client %u timed out\n", client->id);
+            log_stratum("[STRATUM] Client %u timed out\n", client->id);
             client_free(client);
             stratum->clients[i] = NULL;
             stratum->client_count--;
@@ -843,7 +874,7 @@ void ftc_stratum_poll(ftc_stratum_t* stratum)
                 }
             } else if (n == 0) {
                 /* Connection closed */
-                printf("[STRATUM] Client %u disconnected\n", client->id);
+                log_stratum("[STRATUM] Client %u disconnected\n", client->id);
                 client_free(client);
                 stratum->clients[i] = NULL;
                 stratum->client_count--;
@@ -872,7 +903,7 @@ void ftc_stratum_poll(ftc_stratum_t* stratum)
                     if (client->difficulty > STRATUM_MAX_DIFFICULTY)
                         client->difficulty = STRATUM_MAX_DIFFICULTY;
                     stratum_send_difficulty(stratum, client);
-                    printf("[STRATUM] Client %u difficulty increased to %g\n",
+                    log_stratum("[STRATUM] Client %u difficulty increased to %g\n",
                            client->id, client->difficulty);
                 } else if (shares_per_min < 5.0 && client->difficulty > STRATUM_MIN_DIFFICULTY) {
                     /* Too few shares, decrease difficulty */
@@ -880,7 +911,7 @@ void ftc_stratum_poll(ftc_stratum_t* stratum)
                     if (client->difficulty < STRATUM_MIN_DIFFICULTY)
                         client->difficulty = STRATUM_MIN_DIFFICULTY;
                     stratum_send_difficulty(stratum, client);
-                    printf("[STRATUM] Client %u difficulty decreased to %g\n",
+                    log_stratum("[STRATUM] Client %u difficulty decreased to %g\n",
                            client->id, client->difficulty);
                 }
             }

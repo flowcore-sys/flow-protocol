@@ -25,19 +25,29 @@ static bool wsa_initialized = false;
 #include <signal.h>
 #endif
 
+/* Cross-platform unused attribute */
+#ifdef _MSC_VER
+#define MAYBE_UNUSED
+#else
+#define MAYBE_UNUSED __attribute__((unused))
+#endif
+
+/*==============================================================================
+ * FORWARD DECLARATIONS
+ *============================================================================*/
+
+static void mark_address_failed(ftc_p2p_t* p2p, const uint8_t* ip, uint16_t port);
+static const char* format_addr(const ftc_netaddr_t* addr);
+
 /*==============================================================================
  * UTILITY FUNCTIONS
  *============================================================================*/
 
 static void log_p2p(const char* fmt, ...) {
-    va_list args;
-    va_start(args, fmt);
-    printf("[P2P] ");
-    vprintf(fmt, args);
-    printf("\n");
-    va_end(args);
+    (void)fmt;  /* Silent mode */
 }
 
+MAYBE_UNUSED
 static uint32_t hash_to_index(const uint8_t* data, size_t len) {
     uint32_t hash = 5381;
     for (size_t i = 0; i < len; i++) {
@@ -230,6 +240,7 @@ static ftc_socket_t create_listen_socket(uint16_t port) {
  *============================================================================*/
 
 /* Command names */
+MAYBE_UNUSED
 static const char* msg_command(ftc_msg_type_t type) {
     switch (type) {
         case FTC_MSG_VERSION:     return "version";
@@ -281,7 +292,9 @@ static void prepare_header(ftc_msg_header_t* hdr, uint32_t magic,
                            const char* command, const uint8_t* payload, size_t len) {
     memset(hdr, 0, sizeof(*hdr));
     hdr->magic = magic;
-    strncpy((char*)hdr->command, command, 12);
+    size_t cmd_len = strlen(command);
+    if (cmd_len > 12) cmd_len = 12;
+    memcpy(hdr->command, command, cmd_len);
     hdr->length = (uint32_t)len;
     hdr->checksum = calc_checksum(payload, len);
 }
@@ -611,12 +624,26 @@ static void handle_version(ftc_p2p_t* p2p, ftc_peer_t* peer,
     }
 }
 
+/* Reset fail count for address on successful connection */
+static void reset_address_fail_count(ftc_p2p_t* p2p, const uint8_t* ip, uint16_t port) {
+    for (int i = 0; i < p2p->known_addr_count; i++) {
+        if (memcmp(p2p->known_addrs[i].ip, ip, 16) == 0 &&
+            p2p->known_addrs[i].port == port) {
+            p2p->known_addrs[i].fail_count = 0;
+            return;
+        }
+    }
+}
+
 static void handle_verack(ftc_p2p_t* p2p, ftc_peer_t* peer,
                           const uint8_t* payload, size_t len) {
     (void)payload; (void)len;
 
     peer->state = FTC_PEER_ESTABLISHED;
     p2p->total_peers_connected++;
+
+    /* Reset fail count - peer is reachable */
+    reset_address_fail_count(p2p, peer->addr.ip, peer->addr.port);
 
     log_p2p("Handshake complete with %s", format_addr(&peer->addr));
 
@@ -938,7 +965,7 @@ static void handle_getdata(ftc_p2p_t* p2p, ftc_peer_t* peer,
                 ftc_p2p_send_block(p2p, peer, block);
             }
         } else if (type == FTC_INV_TX) {
-            ftc_tx_t* tx = ftc_mempool_get(node->mempool, hash);
+            const ftc_tx_t* tx = ftc_mempool_get(node->mempool, hash);
             if (tx) {
                 ftc_p2p_send_tx(p2p, peer, tx);
             }
@@ -1282,6 +1309,16 @@ void ftc_p2p_disconnect(ftc_p2p_t* p2p, ftc_peer_t* peer, const char* reason) {
 
     log_p2p("Disconnecting %s: %s", format_addr(&peer->addr), reason);
 
+    /* Mark address as failed if it's a connection error (not a clean shutdown) */
+    bool is_error = (strcmp(reason, "recv error") == 0 ||
+                     strcmp(reason, "send error") == 0 ||
+                     strcmp(reason, "connection timeout") == 0 ||
+                     strcmp(reason, "handshake timeout") == 0 ||
+                     strcmp(reason, "timeout") == 0);
+    if (is_error && !peer->inbound) {
+        mark_address_failed(p2p, peer->addr.ip, peer->addr.port);
+    }
+
     if (peer->socket != FTC_INVALID_SOCKET) {
         close(peer->socket);
         peer->socket = FTC_INVALID_SOCKET;
@@ -1477,8 +1514,9 @@ void ftc_p2p_add_address(ftc_p2p_t* p2p, const ftc_netaddr_t* addr) {
     for (int i = 0; i < p2p->known_addr_count; i++) {
         if (memcmp(p2p->known_addrs[i].ip, addr->ip, 16) == 0 &&
             p2p->known_addrs[i].port == addr->port) {
-            /* Update timestamp */
+            /* Update timestamp and reset fail count on successful contact */
             p2p->known_addrs[i].timestamp = addr->timestamp;
+            p2p->known_addrs[i].fail_count = 0;
             return;
         }
     }
@@ -1492,7 +1530,40 @@ void ftc_p2p_add_address(ftc_p2p_t* p2p, const ftc_netaddr_t* addr) {
         p2p->known_addr_capacity = new_cap;
     }
 
-    p2p->known_addrs[p2p->known_addr_count++] = *addr;
+    ftc_netaddr_t new_addr = *addr;
+    new_addr.fail_count = 0;
+    p2p->known_addrs[p2p->known_addr_count++] = new_addr;
+}
+
+/* Remove address from known addresses */
+static void remove_known_address(ftc_p2p_t* p2p, const uint8_t* ip, uint16_t port) {
+    for (int i = 0; i < p2p->known_addr_count; i++) {
+        if (memcmp(p2p->known_addrs[i].ip, ip, 16) == 0 &&
+            p2p->known_addrs[i].port == port) {
+            /* Remove by shifting array */
+            memmove(&p2p->known_addrs[i], &p2p->known_addrs[i + 1],
+                    (p2p->known_addr_count - i - 1) * sizeof(ftc_netaddr_t));
+            p2p->known_addr_count--;
+            return;
+        }
+    }
+}
+
+/* Mark address as failed, remove if too many failures */
+#define FTC_MAX_FAIL_COUNT 3
+static void mark_address_failed(ftc_p2p_t* p2p, const uint8_t* ip, uint16_t port) {
+    for (int i = 0; i < p2p->known_addr_count; i++) {
+        if (memcmp(p2p->known_addrs[i].ip, ip, 16) == 0 &&
+            p2p->known_addrs[i].port == port) {
+            p2p->known_addrs[i].fail_count++;
+            if (p2p->known_addrs[i].fail_count >= FTC_MAX_FAIL_COUNT) {
+                log_p2p("Removing unreachable peer %s (failed %d times)",
+                        format_addr(&p2p->known_addrs[i]), p2p->known_addrs[i].fail_count);
+                remove_known_address(p2p, ip, port);
+            }
+            return;
+        }
+    }
 }
 
 bool ftc_p2p_save_peers(ftc_p2p_t* p2p, const char* path) {
