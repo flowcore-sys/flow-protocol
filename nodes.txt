@@ -1,0 +1,6 @@
+# FTC Mining Nodes (RPC endpoints)
+# Use with: ftc-miner-gpu -address WALLET -solo -peers nodes.txt
+
+15.164.228.225:17318
+18.194.233.15:17318
+107.21.36.212:17318

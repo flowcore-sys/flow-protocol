@@ -1526,6 +1526,40 @@ static void rpc_getminerstats(ftc_rpc_server_t* rpc, ftc_json_t* json, const cha
  * P2POOL RPC METHODS
  *============================================================================*/
 
+static void rpc_getstratumstats(ftc_rpc_server_t* rpc, ftc_json_t* json, const char* id)
+{
+    if (!rpc->handlers || !rpc->handlers->get_stratum_stats) {
+        rpc_error(json, -32601, "Stratum not enabled", id);
+        return;
+    }
+
+    int miners = 0;
+    double hashrate = 0;
+    uint64_t shares = 0, blocks = 0;
+
+    bool ok = rpc->handlers->get_stratum_stats(
+        rpc->handlers->user_data, &miners, &hashrate, &shares, &blocks);
+
+    if (!ok) {
+        rpc_error(json, -32603, "Stratum error", id);
+        return;
+    }
+
+    ftc_json_object_start(json);
+    ftc_json_kv_string(json, "jsonrpc", "2.0");
+
+    ftc_json_key(json, "result");
+    ftc_json_object_start(json);
+    ftc_json_kv_int(json, "miners", miners);
+    ftc_json_kv_double(json, "hashrate", hashrate);
+    ftc_json_kv_uint(json, "shares", shares);
+    ftc_json_kv_uint(json, "blocks", blocks);
+    ftc_json_object_end(json);
+
+    ftc_json_kv_string(json, "id", id);
+    ftc_json_object_end(json);
+}
+
 static void rpc_getpoolstatus(ftc_rpc_server_t* rpc, ftc_json_t* json, const char* id)
 {
     if (!rpc->handlers || !rpc->handlers->p2pool_get_status) {
@@ -1736,6 +1770,8 @@ static void process_request(ftc_rpc_server_t* rpc, const char* request, ftc_json
         rpc_getminerstats(rpc, response, id);
     } else if (strcmp(method, "getpoolstatus") == 0) {
         rpc_getpoolstatus(rpc, response, id);
+    } else if (strcmp(method, "getstratumstats") == 0) {
+        rpc_getstratumstats(rpc, response, id);
     } else if (strcmp(method, "submitshare") == 0) {
         rpc_submitshare(rpc, response, params ? params : "[]", id);
     } else if (strcmp(method, "getpoolpayouts") == 0) {

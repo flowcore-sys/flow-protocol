@@ -579,9 +579,6 @@ static void handle_version(ftc_p2p_t* p2p, ftc_peer_t* peer,
         peer->relay = payload[offset] != 0;
     }
 
-    log_p2p("Peer %s: version=%d, height=%u, ua=%s",
-            format_addr(&peer->addr), peer->version, peer->start_height, peer->user_agent);
-
     /* Check protocol version */
     if (peer->version < FTC_P2P_MIN_PROTOCOL) {
         log_p2p("Peer protocol version too old: %d", peer->version);
@@ -633,8 +630,6 @@ static void handle_verack(ftc_p2p_t* p2p, ftc_peer_t* peer,
         if (!p2p->sync_peer) {
             p2p->sync_peer = peer;
             peer->syncing = true;
-            log_p2p("Starting sync from %s (height %u)",
-                    format_addr(&peer->addr), peer->start_height);
             ftc_p2p_sync_blocks(p2p);
         }
     }
@@ -734,15 +729,62 @@ static void handle_inv(ftc_p2p_t* p2p, ftc_peer_t* peer,
 
         /* Track blocks in flight for sync continuation */
         if (peer->syncing) {
-            int block_count = 0;
+            int blocks_needed = 0;
             for (int i = 0; i < needed_count; i++) {
-                if (needed[i].type == FTC_INV_BLOCK) block_count++;
+                if (needed[i].type == FTC_INV_BLOCK) blocks_needed++;
             }
-            peer->blocks_in_flight += block_count;
+            peer->blocks_in_flight += blocks_needed;
         }
     }
 
     free(needed);
+}
+
+/* Check if block's prev_hash matches our tip */
+static bool block_connects_to_tip(ftc_node_t* node, const ftc_block_t* block) {
+    if (node->chain->block_count == 0) return true;
+
+    ftc_hash256_t tip_hash;
+    ftc_block_hash(node->chain->blocks[node->chain->block_count - 1], tip_hash);
+    return memcmp(block->header.prev_hash, tip_hash, 32) == 0;
+}
+
+/* Store block as orphan */
+static bool store_orphan(ftc_p2p_t* p2p, ftc_block_t* block) {
+    if (p2p->orphan_count >= FTC_MAX_ORPHAN_BLOCKS) {
+        /* Cache full - remove oldest */
+        ftc_block_free(p2p->orphan_blocks[0]);
+        memmove(p2p->orphan_blocks, p2p->orphan_blocks + 1,
+                (FTC_MAX_ORPHAN_BLOCKS - 1) * sizeof(ftc_block_t*));
+        p2p->orphan_count--;
+    }
+    p2p->orphan_blocks[p2p->orphan_count++] = block;
+    return true;
+}
+
+/* Try to add orphan blocks that now connect */
+static void process_orphans(ftc_p2p_t* p2p) {
+    ftc_node_t* node = (ftc_node_t*)p2p->node;
+    if (!node) return;
+
+    bool added_any;
+    do {
+        added_any = false;
+        for (int i = 0; i < p2p->orphan_count; i++) {
+            ftc_block_t* orphan = p2p->orphan_blocks[i];
+            if (block_connects_to_tip(node, orphan)) {
+                if (ftc_chain_add_block(node, orphan)) {
+                    /* Remove from orphan list */
+                    ftc_block_free(orphan);
+                    memmove(p2p->orphan_blocks + i, p2p->orphan_blocks + i + 1,
+                            (p2p->orphan_count - i - 1) * sizeof(ftc_block_t*));
+                    p2p->orphan_count--;
+                    i--;  /* Recheck this position */
+                    added_any = true;
+                }
+            }
+        }
+    } while (added_any);  /* Keep trying until no more orphans connect */
 }
 
 static void handle_block(ftc_p2p_t* p2p, ftc_peer_t* peer,
@@ -753,16 +795,19 @@ static void handle_block(ftc_p2p_t* p2p, ftc_peer_t* peer,
     /* Deserialize block */
     ftc_block_t* block = ftc_block_deserialize(payload, len);
     if (!block) {
-        log_p2p("Failed to deserialize block from %s", format_addr(&peer->addr));
         peer->ban_score += 10;
         return;
     }
 
-    /* Validate and add block */
-    if (ftc_node_validate_block(node, block)) {
+    /* Check if block connects to our tip */
+    if (block_connects_to_tip(node, block)) {
+        /* Block connects - try to add */
         if (ftc_chain_add_block(node, block)) {
             /* Broadcast to other peers */
             ftc_p2p_broadcast_block(p2p, block);
+
+            /* Check if orphans now connect */
+            process_orphans(p2p);
 
             /* Continue sync if needed */
             if (peer->syncing) {
@@ -772,10 +817,27 @@ static void handle_block(ftc_p2p_t* p2p, ftc_peer_t* peer,
                 }
             }
         }
+        ftc_block_free(block);  /* Always free - add_block clones */
     } else {
-        log_p2p("Invalid block from %s", format_addr(&peer->addr));
-        peer->ban_score += 100;
-        ftc_block_free(block);
+        /* Block doesn't connect - check if we already have it */
+        ftc_hash256_t block_hash;
+        ftc_block_hash(block, block_hash);
+        if (ftc_chain_get_block(node->chain, block_hash) != NULL) {
+            /* Already have this block */
+            ftc_block_free(block);
+            return;
+        }
+
+        /* Store as orphan for later */
+        store_orphan(p2p, block);  /* Ownership transferred to orphan cache */
+
+        /* Track for sync continuation */
+        if (peer->syncing) {
+            peer->blocks_in_flight--;
+            if (peer->blocks_in_flight == 0) {
+                ftc_p2p_sync_blocks(p2p);
+            }
+        }
     }
 }
 
@@ -1089,6 +1151,13 @@ void ftc_p2p_free(ftc_p2p_t* p2p) {
     for (int i = 0; i < FTC_P2P_MAX_PEERS; i++) {
         if (p2p->peers[i]) {
             peer_free(p2p->peers[i]);
+        }
+    }
+
+    /* Free orphan blocks */
+    for (int i = 0; i < p2p->orphan_count; i++) {
+        if (p2p->orphan_blocks[i]) {
+            ftc_block_free(p2p->orphan_blocks[i]);
         }
     }
 

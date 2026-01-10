@@ -565,7 +565,6 @@ bool ftc_node_validate_block(ftc_node_t* node, const ftc_block_t* block)
         ftc_hash256_t prev_hash;
         ftc_block_hash(node->chain->blocks[node->chain->block_count - 1], prev_hash);
         if (memcmp(block->header.prev_hash, prev_hash, 32) != 0) {
-            /* Silent reject - too noisy during sync */
             return false;
         }
     }
@@ -743,14 +742,17 @@ ftc_block_t* ftc_node_create_block_template(ftc_node_t* node, const ftc_address_
 
         /* Calculate adjustment ratio with damping
          * new_target = prev_target * sum_weighted_time / target_weighted_time
-         * Limit adjustment to 1.5x per block to prevent wild swings
+         * Limit adjustment to 5% per block to prevent oscillation
          */
         int64_t ratio_num = sum_weighted_time;
         int64_t ratio_den = target_weighted_time;
 
-        /* Limit adjustment to 150% increase or 67% decrease per block */
-        if (ratio_num > ratio_den * 3 / 2) ratio_num = ratio_den * 3 / 2;
-        if (ratio_num < ratio_den * 2 / 3) ratio_num = ratio_den * 2 / 3;
+        /* Limit adjustment to 5% per block for smooth difficulty changes
+         * This prevents oscillation when hashrate changes rapidly
+         * With 5% limit: 3x hashrate change takes ~22 blocks to stabilize
+         */
+        if (ratio_num > ratio_den * 21 / 20) ratio_num = ratio_den * 21 / 20;  /* Max 5% easier */
+        if (ratio_num < ratio_den * 19 / 20) ratio_num = ratio_den * 19 / 20;  /* Max 5% harder */
 
         /* Apply adjustment to target */
         uint32_t t32[8];
@@ -980,10 +982,8 @@ static double rpc_get_difficulty(void* ctx)
 static int rpc_get_peer_count(void* ctx)
 {
     ftc_node_t* node = (ftc_node_t*)ctx;
-    /* Return P2P peer count + active miners */
-    int p2p_peers = node->p2p ? ftc_p2p_peer_count(node->p2p) : 0;
-    int miners = ftc_rpc_get_active_miners(node->rpc);
-    return p2p_peers + miners;
+    /* Return only P2P peer count (real node connections) */
+    return node->p2p ? ftc_p2p_peer_count(node->p2p) : 0;
 }
 
 static int rpc_get_peer_info(void* ctx, char** addresses, int* ports, int64_t* ping_times, int max_peers)
@@ -1014,8 +1014,7 @@ static int rpc_get_peer_info(void* ctx, char** addresses, int* ports, int64_t* p
                      peer->addr.ip[14], peer->addr.ip[15]);
         }
 
-        strncpy(addresses[count], ip_str, 63);
-        addresses[count][63] = '\0';
+        snprintf(addresses[count], 64, "%s", ip_str);
         ports[count] = peer->addr.port;
         ping_times[count] = peer->ping_time;  /* RTT in ms */
         count++;
@@ -1040,8 +1039,7 @@ static int rpc_get_peer_info(void* ctx, char** addresses, int* ports, int64_t* p
         }
         if (found) continue;
 
-        strncpy(addresses[count], ip_str, 63);
-        addresses[count][63] = '\0';
+        snprintf(addresses[count], 64, "%s", ip_str);
         ports[count] = addr->port;
         ping_times[count] = -1;  /* Unknown ping time for non-connected peers */
         count++;
@@ -1111,6 +1109,31 @@ static const char* rpc_get_data_dir(void* ctx)
 }
 
 /*==============================================================================
+ * STRATUM RPC HANDLERS
+ *============================================================================*/
+
+static bool rpc_get_stratum_stats(void* ctx, int* miners, double* hashrate, uint64_t* shares, uint64_t* blocks)
+{
+    ftc_node_t* node = (ftc_node_t*)ctx;
+    if (!node->stratum) {
+        *miners = 0;
+        *hashrate = 0;
+        *shares = 0;
+        *blocks = 0;
+        return true;  /* Return empty stats instead of error */
+    }
+
+    ftc_stratum_stats_t stats;
+    ftc_stratum_get_stats(node->stratum, &stats);
+
+    *miners = stats.active_miners;
+    *hashrate = stats.pool_hashrate;
+    *shares = stats.total_shares;
+    *blocks = stats.total_blocks;
+    return true;
+}
+
+/*==============================================================================
  * P2POOL RPC HANDLERS
  *============================================================================*/
 
@@ -1176,7 +1199,6 @@ void ftc_node_config_default(ftc_node_config_t* config)
     config->stratum_port = STRATUM_DEFAULT_PORT;  /* 3333 */
     config->listen = true;  /* Accept incoming P2P connections by default */
     config->stratum_enabled = false;  /* Stratum disabled by default */
-    config->testnet = false;
     strcpy(config->data_dir, FTC_DATA_DIR);
     config->wallet_enabled = true;
     config->log_level = 1;
@@ -1323,6 +1345,7 @@ bool ftc_node_start(ftc_node_t* node)
 
     /* Initialize auto-save state */
     node->last_save_height = node->chain->best_height;
+    node->last_save_time = time(NULL);
 
     /* Setup RPC handlers */
     static ftc_rpc_handlers_t rpc_handlers = {
@@ -1343,6 +1366,7 @@ bool ftc_node_start(ftc_node_t* node)
         .p2pool_get_status = rpc_p2pool_get_status,
         .p2pool_submit_share = rpc_p2pool_submit_share,
         .p2pool_get_payouts = rpc_p2pool_get_payouts,
+        .get_stratum_stats = rpc_get_stratum_stats,
     };
     rpc_handlers.user_data = node;
     ftc_rpc_set_handlers(node->rpc, &rpc_handlers);
@@ -1429,13 +1453,15 @@ void ftc_node_poll(ftc_node_t* node)
     /* Process RPC */
     ftc_rpc_poll(node->rpc, 10);
 
-    /* Auto-save blockchain: save immediately when new blocks arrive */
+    /* Auto-save blockchain every 60 seconds if new blocks arrived */
     uint32_t height = node->chain->best_height;
-    if (height > node->last_save_height) {
+    int64_t now = time(NULL);
+    if (height > node->last_save_height && (now - node->last_save_time) >= 60) {
         char blocks_path[512];
         snprintf(blocks_path, sizeof(blocks_path), "%s/blocks.dat", node->config.data_dir);
         if (ftc_chain_save(node->chain, blocks_path)) {
             node->last_save_height = height;
+            node->last_save_time = now;
         }
     }
 }
@@ -1485,8 +1511,11 @@ static void print_dashboard(ftc_node_t* node)
     /* Move cursor to home and clear screen */
     printf("\033[H\033[J");
 
-    /* Get active miners count */
+    /* Get active miners count (RPC + Stratum) */
     int active_miners = ftc_rpc_get_active_miners(node->rpc);
+    if (node->stratum) {
+        active_miners += ftc_stratum_get_miner_count(node->stratum);
+    }
 
     /* Print dashboard */
     printf("+--------------------------------------------------------------+\n");

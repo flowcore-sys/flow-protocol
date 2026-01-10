@@ -289,6 +289,11 @@ typedef struct ftc_p2p {
     ftc_peer_t*     sync_peer;          /* Peer we're syncing from */
     bool            initial_sync;       /* In initial block download */
 
+    /* Orphan block cache (blocks whose parent we don't have yet) */
+    #define FTC_MAX_ORPHAN_BLOCKS 100
+    ftc_block_t*    orphan_blocks[100];
+    int             orphan_count;
+
 } ftc_p2p_t;
 
 /*==============================================================================

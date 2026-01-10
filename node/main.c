@@ -4,12 +4,14 @@
  * Usage: ftc-node [options]
  *
  * Options:
- *   -port <port>       P2P port (default: 17317)
  *   -rpcport <port>    RPC port (default: 17318)
+ *   -stratum [port]    Enable Stratum pool server (default: 3333)
  *   -datadir <dir>     Data directory (default: ftcdata)
- *   -testnet           Use testnet
- *   -seed <host>       Add seed node
+ *   -addnode <ip:port> Add peer to connect to
+ *   -peers <file>      Load peers from file
  *   -bootstrap <url>   Download blocks.dat from URL
+ *   -nowallet          Disable wallet
+ *   -recover           Recovery mode
  *   -help              Show help
  */
 
@@ -252,16 +254,15 @@ static void print_help(void)
     printf("  -datadir <dir>     Data directory (default: ftcdata)\n");
     printf("  -addnode <ip:port> Add a peer to connect to (can use multiple times)\n");
     printf("  -peers <file>      Load peers from text file (one per line)\n");
-    printf("  -testnet           Use testnet\n");
     printf("  -bootstrap <url>   Download blocks.dat from node URL\n");
     printf("  -nowallet          Disable wallet\n");
     printf("  -recover           Recovery mode: skip validation when loading blocks\n");
     printf("  -help              Show this help\n");
     printf("\n");
     printf("Example:\n");
-    printf("  ftc-node -addnode 15.164.228.225:17319\n");
-    printf("  ftc-node -peers peers.txt\n");
-    printf("  ftc-node -datadir /var/ftc -rpcport 17318\n");
+    printf("  ftc-node -addnode 15.164.228.225:17317\n");
+    printf("  ftc-node -bootstrap http://15.164.228.225:17318/blocks.dat\n");
+    printf("  ftc-node -datadir /var/ftc -stratum\n");
     printf("\n");
 }
 
@@ -290,9 +291,6 @@ int main(int argc, char* argv[])
         }
         else if (strcmp(argv[i], "-datadir") == 0 && i + 1 < argc) {
             strncpy(config.data_dir, argv[++i], sizeof(config.data_dir) - 1);
-        }
-        else if (strcmp(argv[i], "-testnet") == 0) {
-            config.testnet = true;
         }
         else if (strcmp(argv[i], "-bootstrap") == 0 && i + 1 < argc) {
             bootstrap_url = argv[++i];

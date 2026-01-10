@@ -83,6 +83,9 @@ typedef struct {
     bool (*p2pool_submit_share)(void* ctx, const char* miner_addr, uint64_t work_done, const uint8_t* block_hash);
     int (*p2pool_get_payouts)(void* ctx, uint64_t reward, char** addresses, uint64_t* amounts, int max_payouts);
 
+    /* Stratum pool stats */
+    bool (*get_stratum_stats)(void* ctx, int* miners, double* hashrate, uint64_t* shares, uint64_t* blocks);
+
     /* User data */
     void* user_data;
 } ftc_rpc_handlers_t;

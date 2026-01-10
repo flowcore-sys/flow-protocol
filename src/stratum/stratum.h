@@ -50,9 +50,9 @@ extern "C" {
 #define STRATUM_JOB_ID_SIZE         8
 #define STRATUM_PING_INTERVAL       30      /* Seconds between pings */
 #define STRATUM_TIMEOUT             120     /* Disconnect after 2 min silence */
-#define STRATUM_DEFAULT_DIFFICULTY  1.0     /* Starting difficulty */
-#define STRATUM_MIN_DIFFICULTY      0.001   /* Minimum difficulty */
-#define STRATUM_MAX_DIFFICULTY      1000000 /* Maximum difficulty */
+#define STRATUM_DEFAULT_DIFFICULTY  32.0        /* Starting difficulty for ~1GH/s miners */
+#define STRATUM_MIN_DIFFICULTY      1.0         /* Minimum difficulty */
+#define STRATUM_MAX_DIFFICULTY      1e15        /* No practical limit (supports 1 PH/s+) */
 
 /*==============================================================================
  * STRATUM CLIENT (connected miner)

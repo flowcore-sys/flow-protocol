@@ -10,6 +10,47 @@
 #include <time.h>
 
 /*==============================================================================
+ * CHECKPOINTS - Skip validation for blocks before known checkpoints
+ *============================================================================*/
+
+typedef struct {
+    uint32_t height;
+    const char* hash_hex;  /* Block hash in hex (for easy updates) */
+} ftc_checkpoint_t;
+
+/* Add checkpoints here as the chain grows */
+static const ftc_checkpoint_t CHECKPOINTS[] = {
+    { 0,     "0000000000000000000000000000000000000000000000000000000000000000" },  /* Genesis */
+    { 10000, NULL },  /* Will be filled when chain reaches this height */
+    { 25000, NULL },
+};
+static const int CHECKPOINT_COUNT = sizeof(CHECKPOINTS) / sizeof(CHECKPOINTS[0]);
+
+/* Last checkpoint height (for fast sync) */
+static uint32_t g_last_checkpoint = 0;
+
+void ftc_set_checkpoint_height(uint32_t height) {
+    g_last_checkpoint = height;
+}
+
+uint32_t ftc_get_checkpoint_height(void) {
+    /* Find highest defined checkpoint */
+    for (int i = CHECKPOINT_COUNT - 1; i >= 0; i--) {
+        if (CHECKPOINTS[i].hash_hex != NULL) {
+            return CHECKPOINTS[i].height;
+        }
+    }
+    return g_last_checkpoint;
+}
+
+/* Check if we can skip full validation (block is before checkpoint) */
+static bool can_skip_validation(uint32_t height) {
+    /* Use configured checkpoint or hardcoded default */
+    uint32_t checkpoint = g_last_checkpoint > 0 ? g_last_checkpoint : 25000;
+    return height < checkpoint;
+}
+
+/*==============================================================================
  * DIFFICULTY CALCULATION
  *============================================================================*/
 
@@ -195,6 +236,26 @@ ftc_error_t ftc_validate_block(
 {
     if (!block) return FTC_ERR_INVALID_PARAM;
 
+    /* Calculate height */
+    uint32_t height = prev_index ? prev_index->height + 1 : 0;
+
+    /* Fast sync: skip expensive validation for blocks before checkpoint */
+    if (can_skip_validation(height)) {
+        /* Only do minimal header check (POW) */
+        ftc_hash256_t hash;
+        ftc_block_hash(block, hash);
+
+        ftc_hash256_t target;
+        ftc_bits_to_target(block->header.bits, target);
+
+        /* Verify proof-of-work */
+        for (int i = 31; i >= 0; i--) {
+            if (hash[i] < target[i]) break;
+            if (hash[i] > target[i]) return FTC_ERR_INVALID_DIFFICULTY;
+        }
+        return FTC_OK;  /* Skip other validation */
+    }
+
     /* Validate header */
     ftc_error_t err = ftc_validate_block_header(&block->header, prev_index);
     if (err != FTC_OK) return err;
@@ -208,9 +269,6 @@ ftc_error_t ftc_validate_block(
     if (size > FTC_MAX_BLOCK_SIZE) {
         return FTC_ERR_INVALID_BLOCK;
     }
-
-    /* Calculate height */
-    uint32_t height = prev_index ? prev_index->height + 1 : 0;
 
     /* Calculate total fees and validate transactions */
     uint64_t total_fees = 0;

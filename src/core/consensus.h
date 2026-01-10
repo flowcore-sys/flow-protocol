@@ -199,6 +199,21 @@ ftc_block_index_t* ftc_block_index_ancestor(
     uint32_t height
 );
 
+/*==============================================================================
+ * CHECKPOINTS (Fast Sync)
+ *============================================================================*/
+
+/**
+ * Set checkpoint height for fast sync
+ * Blocks before this height will have minimal validation
+ */
+void ftc_set_checkpoint_height(uint32_t height);
+
+/**
+ * Get current checkpoint height
+ */
+uint32_t ftc_get_checkpoint_height(void);
+
 #ifdef __cplusplus
 }
 #endif

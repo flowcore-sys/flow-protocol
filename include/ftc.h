@@ -58,7 +58,7 @@ extern "C" {
 
 #define FTC_TARGET_BLOCK_TIME   60          /* 60 seconds */
 #define FTC_DIFFICULTY_INTERVAL 2016        /* Legacy: Retarget every 2016 blocks */
-#define FTC_LWMA_WINDOW         60          /* LWMA: Use last 60 blocks for averaging */
+#define FTC_LWMA_WINDOW         144         /* LWMA: Use last 144 blocks (~2.5 hours) for smooth adjustment */
 #define FTC_LWMA_ACTIVATION     25000       /* Activate LWMA after this height */
 #define FTC_MAX_FUTURE_TIME     7200        /* 2 hours */
 

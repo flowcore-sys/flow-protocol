@@ -30,6 +30,9 @@
 #define WOULD_BLOCK (errno == EAGAIN || errno == EWOULDBLOCK)
 #endif
 
+/* Forward declarations */
+static void stratum_create_job(ftc_stratum_t* stratum);
+
 /*==============================================================================
  * UTILITY FUNCTIONS
  *============================================================================*/
@@ -228,7 +231,12 @@ static void stratum_handle_authorize(ftc_stratum_t* stratum, stratum_client_t* c
                     memcpy(client->miner_address, client->worker_name, addr_len);
                     client->miner_address[addr_len] = '\0';
                 } else {
-                    strncpy(client->miner_address, client->worker_name, sizeof(client->miner_address) - 1);
+                    size_t len = strlen(client->worker_name);
+                    if (len >= sizeof(client->miner_address)) {
+                        len = sizeof(client->miner_address) - 1;
+                    }
+                    memcpy(client->miner_address, client->worker_name, len);
+                    client->miner_address[len] = '\0';
                 }
             }
         }
@@ -240,6 +248,12 @@ static void stratum_handle_authorize(ftc_stratum_t* stratum, stratum_client_t* c
         client->state = STRATUM_CLIENT_AUTHORIZED;
         stratum_send_result(client, id, "true");
         printf("[STRATUM] Client %u authorized as %s\n", client->id, client->miner_address);
+
+        /* If no block template yet (first miner), create job now */
+        if (!stratum->current_job.block_template) {
+            printf("[STRATUM] First miner connected, creating job...\n");
+            stratum_create_job(stratum);
+        }
     } else {
         stratum_send_error(client, id, 20, "Invalid worker address");
         printf("[STRATUM] Client %u authorization failed: invalid address '%s'\n",
@@ -261,16 +275,16 @@ static void stratum_send_difficulty(ftc_stratum_t* stratum, stratum_client_t* cl
 static void stratum_send_job(ftc_stratum_t* stratum, stratum_client_t* client, bool clean)
 {
     stratum_job_t* job = &stratum->current_job;
-    if (!job->block_template) return;
+    if (!job->block_template) {
+        printf("[STRATUM] Cannot send job - no block template\n");
+        return;
+    }
 
-    /* Convert hashes to hex (reversed for Stratum protocol) */
+    /* Convert hashes to hex (NOT reversed - simplified FTC protocol) */
     char prevhash_hex[65];
-    char merkle_hex[65];
+    bytes_to_hex(job->prevhash, 32, prevhash_hex);
 
-    bytes_to_hex_reverse(job->prevhash, 32, prevhash_hex);
-    bytes_to_hex_reverse(job->merkle_root, 32, merkle_hex);
-
-    /* For FTC, we send merkle_root directly in coinb1 field (simplified) */
+    /* For FTC, we send merkle_root directly in coinb1 field */
     char coinb1_hex[65];
     bytes_to_hex(job->merkle_root, 32, coinb1_hex);
 
@@ -291,7 +305,8 @@ static void stratum_send_job(ftc_stratum_t* stratum, stratum_client_t* client, b
              clean ? "true" : "false");
 
     client_send(client, msg);
-    strncpy(client->current_job_id, job->job_id, STRATUM_JOB_ID_SIZE);
+    snprintf(client->current_job_id, sizeof(client->current_job_id), "%s", job->job_id);
+    printf("[STRATUM] Sent job %s to client %u\n", job->job_id, client->id);
 }
 
 static void stratum_handle_submit(ftc_stratum_t* stratum, stratum_client_t* client, int id, const char* params)
@@ -369,9 +384,9 @@ static void stratum_handle_submit(ftc_stratum_t* stratum, stratum_client_t* clie
     memcpy(header + 72, &job->nbits, 4);
     memcpy(header + 76, &nonce, 4);
 
-    /* Hash the header */
+    /* Hash the header (double Keccak256 like GPU) */
     ftc_hash256_t hash;
-    ftc_keccak256(header, 80, hash);
+    ftc_keccak256_double(header, 80, hash);
 
     /* Calculate share target from pool difficulty */
     ftc_hash256_t share_target;
@@ -494,14 +509,13 @@ static void stratum_handle_message(ftc_stratum_t* stratum, stratum_client_t* cli
     /* Dispatch */
     if (strcmp(method, "mining.subscribe") == 0) {
         stratum_handle_subscribe(stratum, client, id, params);
-        /* Send difficulty and initial job */
-        if (client->state >= STRATUM_CLIENT_SUBSCRIBED) {
-            stratum_send_difficulty(stratum, client);
-        }
+        /* Note: Don't send difficulty here - it would stay in client's buffer
+         * and interfere with authorize response. Send after authorize instead. */
     } else if (strcmp(method, "mining.authorize") == 0) {
         stratum_handle_authorize(stratum, client, id, params);
-        /* Send job after authorization */
+        /* Send difficulty and job after authorization */
         if (client->state == STRATUM_CLIENT_AUTHORIZED) {
+            stratum_send_difficulty(stratum, client);
             stratum_send_job(stratum, client, true);
         }
     } else if (strcmp(method, "mining.submit") == 0) {
@@ -553,28 +567,49 @@ static void stratum_create_job(ftc_stratum_t* stratum)
     job->ntime = (uint32_t)time(NULL);
     job->clean_jobs = true;
 
-    /* Create block template for this job */
-    ftc_address_t pool_addr;
-    memset(pool_addr, 0, sizeof(pool_addr));
+    /* Create block template with P2Pool payouts to ALL miners */
+    ftc_address_t fallback_addr;
+    memset(fallback_addr, 0, sizeof(fallback_addr));
 
-    /* Use first connected miner's address, or fallback */
-    bool found_miner = false;
-    for (int i = 0; i < STRATUM_MAX_CLIENTS && !found_miner; i++) {
+    /* Get first miner address as fallback (in case no shares yet) */
+    for (int i = 0; i < STRATUM_MAX_CLIENTS; i++) {
         if (stratum->clients[i] && stratum->clients[i]->state == STRATUM_CLIENT_AUTHORIZED) {
-            ftc_address_decode(stratum->clients[i]->miner_address, pool_addr, NULL);
-            found_miner = true;
+            ftc_address_decode(stratum->clients[i]->miner_address, fallback_addr, NULL);
+            break;
         }
     }
 
-    if (found_miner) {
-        job->block_template = ftc_node_create_block_template(node, pool_addr);
-        if (job->block_template) {
-            /* Get merkle root and bits from block template */
-            memcpy(job->merkle_root, job->block_template->header.merkle_root, 32);
-            job->nbits = job->block_template->header.bits;
+    /* Create base block template */
+    job->block_template = ftc_node_create_block_template(node, fallback_addr);
+    if (job->block_template) {
+        /* Replace coinbase with P2Pool multi-payout coinbase if we have shares */
+        if (stratum->p2pool && stratum->p2pool->pplns && stratum->p2pool->pplns->miner_count > 0) {
+            uint64_t block_reward = 50 * 100000000ULL;  /* 50 FTC in satoshis */
+            uint64_t fees = 0;  /* TODO: calculate from mempool */
+
+            ftc_tx_t* p2pool_coinbase = ftc_p2pool_create_coinbase(
+                stratum->p2pool, job->height, block_reward, fees);
+
+            if (p2pool_coinbase) {
+                /* Replace the coinbase transaction */
+                if (job->block_template->tx_count > 0 && job->block_template->transactions[0]) {
+                    ftc_tx_free(job->block_template->transactions[0]);
+                }
+                job->block_template->transactions[0] = p2pool_coinbase;
+
+                /* Recalculate merkle root */
+                ftc_block_merkle_root(job->block_template, job->block_template->header.merkle_root);
+
+                printf("[STRATUM] P2Pool coinbase: %d miners will share reward\n",
+                       p2pool_coinbase->output_count);
+            }
         }
+
+        /* Get merkle root and bits from block template */
+        memcpy(job->merkle_root, job->block_template->header.merkle_root, 32);
+        job->nbits = job->block_template->header.bits;
     } else {
-        /* No miner - use tip's bits as fallback */
+        /* No block template - use tip's bits as fallback */
         job->nbits = tip->header.bits;
     }
 

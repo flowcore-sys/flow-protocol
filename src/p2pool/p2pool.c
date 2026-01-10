@@ -75,7 +75,7 @@ static ftc_pplns_entry_t* pplns_add_miner(ftc_pplns_t* pplns, const char* addres
     /* Add new miner */
     ftc_pplns_entry_t* miner = &pplns->miners[pplns->miner_count++];
     memset(miner, 0, sizeof(*miner));
-    strncpy(miner->address, address, sizeof(miner->address) - 1);
+    snprintf(miner->address, sizeof(miner->address), "%s", address);
     return miner;
 }
 
@@ -212,7 +212,7 @@ ftc_share_t* ftc_p2pool_create_share(ftc_p2pool_t* p2pool,
     share->bits = p2pool->share_target;
     share->nonce = nonce;
 
-    strncpy(share->miner_address, miner_address, sizeof(share->miner_address) - 1);
+    snprintf(share->miner_address, sizeof(share->miner_address), "%s", miner_address);
 
     /* Estimate work done based on share difficulty */
     ftc_hash256_t target;
@@ -370,7 +370,7 @@ ftc_payout_t* ftc_p2pool_get_payouts(ftc_p2pool_t* p2pool,
         if (amount < p2pool->min_payout) continue;
 
         /* Add payout */
-        strncpy(payouts[count].address, miner->address, sizeof(payouts[count].address) - 1);
+        snprintf(payouts[count].address, sizeof(payouts[count].address), "%s", miner->address);
         payouts[count].amount = amount;
         total_paid += amount;
         count++;

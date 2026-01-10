@@ -65,7 +65,6 @@ typedef struct {
     uint16_t        stratum_port;       /* Stratum mining pool port */
     bool            listen;             /* Accept incoming P2P connections */
     bool            stratum_enabled;    /* Enable Stratum server for pool mining */
-    bool            testnet;
 
     /* Data */
     char            data_dir[256];
@@ -158,6 +157,7 @@ typedef struct ftc_node {
 
     /* Auto-save state */
     uint32_t            last_save_height;
+    int64_t             last_save_time;
 
 } ftc_node_t;
 
