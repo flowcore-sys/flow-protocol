@@ -5,6 +5,7 @@
 #include "rpc.h"
 #include "../crypto/keccak256.h"
 #include "../crypto/keys.h"
+#include "../wallet/wallet.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1720,6 +1721,84 @@ static void rpc_getpoolpayouts(ftc_rpc_server_t* rpc, ftc_json_t* json, const ch
 }
 
 /*==============================================================================
+ * WALLET RPC METHODS
+ *============================================================================*/
+
+static void rpc_getnewaddress(ftc_rpc_server_t* rpc, ftc_json_t* json, const char* id)
+{
+    /* Get wallet path from handlers */
+    if (!rpc->handlers || !rpc->handlers->get_data_dir) {
+        rpc_error(json, -1, "Data directory not available", id);
+        return;
+    }
+
+    const char* data_dir = rpc->handlers->get_data_dir(rpc->handlers->user_data);
+    if (!data_dir) {
+        rpc_error(json, -1, "Data directory not configured", id);
+        return;
+    }
+
+    /* Build wallet path */
+    char wallet_path[512];
+    snprintf(wallet_path, sizeof(wallet_path), "%s/wallet.dat", data_dir);
+
+    /* Load or create wallet */
+    ftc_wallet_t* wallet = ftc_wallet_load(wallet_path);
+    if (!wallet) {
+        wallet = ftc_wallet_new();
+        if (!wallet) {
+            rpc_error(json, -1, "Failed to create wallet", id);
+            return;
+        }
+    }
+
+    /* Generate new key */
+    ftc_wallet_key_t* key = ftc_wallet_new_key(wallet, "RPC Generated");
+    if (!key) {
+        ftc_wallet_free(wallet);
+        rpc_error(json, -1, "Failed to generate key", id);
+        return;
+    }
+
+    /* Get address string */
+    char addr_str[64];
+    ftc_address_encode(key->address, true, addr_str);
+
+    /* Get WIF private key */
+    char wif[64];
+    ftc_privkey_to_wif(key->privkey, true, wif);
+
+    /* Convert pubkey to hex */
+    char pubkey_hex[65];
+    for (int i = 0; i < 32; i++) {
+        sprintf(pubkey_hex + i * 2, "%02x", key->pubkey[i]);
+    }
+
+    /* Save wallet */
+    if (!ftc_wallet_save(wallet, wallet_path)) {
+        ftc_wallet_free(wallet);
+        rpc_error(json, -1, "Failed to save wallet", id);
+        return;
+    }
+
+    ftc_wallet_free(wallet);
+
+    /* Return result */
+    ftc_json_object_start(json);
+    ftc_json_kv_string(json, "jsonrpc", "2.0");
+
+    ftc_json_key(json, "result");
+    ftc_json_object_start(json);
+    ftc_json_kv_string(json, "address", addr_str);
+    ftc_json_kv_string(json, "pubkey", pubkey_hex);
+    ftc_json_kv_string(json, "privkey", wif);
+    ftc_json_object_end(json);
+
+    ftc_json_kv_string(json, "id", id);
+    ftc_json_object_end(json);
+}
+
+/*==============================================================================
  * REQUEST HANDLING
  *============================================================================*/
 
@@ -1769,6 +1848,8 @@ static void process_request(ftc_rpc_server_t* rpc, const char* request, ftc_json
         rpc_listunspent(rpc, response, params ? params : "[]", id);
     } else if (strcmp(method, "getinfo") == 0) {
         rpc_getinfo(rpc, response, id);
+    } else if (strcmp(method, "getnewaddress") == 0) {
+        rpc_getnewaddress(rpc, response, id);
     } else if (strcmp(method, "getblocktemplate") == 0) {
         rpc_getblocktemplate(rpc, response, params ? params : "[]", id, client_ip);
     } else if (strcmp(method, "submitblock") == 0) {
@@ -1868,6 +1949,29 @@ static void handle_client_with_ip(ftc_rpc_server_t* rpc, ftc_rpc_socket_t client
         /* File not found */
         const char* not_found = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
         send(client, not_found, (int)strlen(not_found), 0);
+        free(request);
+        close_rpc_socket(client);
+        return;
+    }
+
+    /* Check for GET /getnewaddress request (simple wallet generation) */
+    if (strncmp(request, "GET /getnewaddress", 18) == 0) {
+        ftc_json_t* response = ftc_json_new();
+        rpc_getnewaddress(rpc, response, "1");
+        ftc_json_finalize(response);
+
+        char header[256];
+        snprintf(header, sizeof(header),
+                 "HTTP/1.1 200 OK\r\n"
+                 "Content-Type: application/json\r\n"
+                 "Content-Length: %zu\r\n"
+                 "Connection: close\r\n"
+                 "\r\n",
+                 response->len);
+        send(client, header, (int)strlen(header), 0);
+        send(client, response->data, (int)response->len, 0);
+
+        ftc_json_free(response);
         free(request);
         close_rpc_socket(client);
         return;
